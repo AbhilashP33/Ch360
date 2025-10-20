@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Product Appropriateness – Client360 ETL
+- Unaltered Teradata SQL (no volatile tables)
+- DataFrame-only transforms
+- Detailed logging
+- Includes assessment & count-by-tool aggregates
+"""
+
+import pandas as pd
+import numpy as np
+import logging
+from datetime import date, timedelta
+
+# ------------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------------
+runday = pd.Timestamp.today().strftime("%Y%m%d")
+
+# Replace these three with your dynamic date logic if needed
+wk_start = pd.to_datetime("2023-05-07")
+wk_end = pd.to_datetime("2023-05-14")
+wk_start_min14 = wk_start - pd.Timedelta(days=14)
+
+logfile = f"./logs/pa_client360_{runday}.log"
+logging.basicConfig(
+    filename=logfile,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logging.info("=== Starting Client360 ETL ===")
+logging.info(f"wk_start={wk_start.date()}, wk_end={wk_end.date()}, wk_start_min14={wk_start_min14.date()}")
+
+# ------------------------------------------------------------------------------
+# HELPERS (minimal; keep code linear)
+# ------------------------------------------------------------------------------
+def end_of_week_sun(series_like) -> pd.Series:
+    dt = pd.to_datetime(series_like)
+    return dt + pd.to_timedelta(6 - dt.dt.weekday, unit="D")
+
+def _normalize_txt(x):
+    if pd.isna(x):
+        return ""
+    return " ".join(str(x).split()).upper().strip()
+
+def _flags(x):
+    s = _normalize_txt(x)
+    f1 = 0 if len(s) > 5 else 1                         # >5 chars
+    nz = s.replace(" ", "")
+    f2 = 0 if len(set(nz)) >= 2 else 1                  # at least 2 distinct chars
+    f3 = 0 if sum(ch.isalnum() for ch in s) >= 2 else 1 # at least 2 alnum
+    cat = "Valid" if (f1 + f2 + f3) == 0 else "Invalid"
+    return pd.Series(
+        [f1, f2, f3, cat],
+        index=["xfail_chars_gt5", "xfail_rep_char", "xfail_ge_2_alnum", "prod_not_aprp_rtnl_txt_cat"],
+    )
+
+def map_pa_result(val: str) -> str:
+    if val == "Product Appropriateness assessed outside Client 360":
+        return "Product Appropriateness assessed outside Client 360"
+    if val == "Not Appropriate - Rationale":
+        return "Product Not Appropriate"
+    if val == "Client declined product appropriateness assessment":
+        return "Client declined product appropriateness assessment"
+    if val == "Product Appropriate":
+        return "Product Appropriate"
+    return "Missing"
+
+CS_CMT = {
+    "COM1": "Test population (less samples)",
+    "COM2": "Match population",
+    "COM3": "Mismatch population (less samples)",
+    "COM4": "Non Anomaly Population",
+    "COM5": "Anomaly Population",
+    "COM6": "Number of Deposit Sessions",
+    "COM7": "Number of Accounts",
+    "COM8": "Number of Transactions",
+    "COM9": "Non Blank Population",
+    "COM10": "Blank Population",
+    "COM11": "Unable to Assess",
+    "COM12": "Number of Failed Data Elements",
+    "COM13": "Population Distribution",
+    "COM14": "Reconciled Population",
+    "COM15": "Not Reconciled Population",
+    "COM16": "Pass",
+    "COM17": "Fail",
+    "COM18": "Not Applicable",
+    "COM19": "Potential Fail",
+}
+
+# ------------------------------------------------------------------------------
+# 1) TRACKING LOG EXTRACT (SQL UNCHANGED)
+# ------------------------------------------------------------------------------
+logging.info("Extract: tracking_all …")
+tracking_all = td_read_sql(f"""
+    SELECT *
+    FROM ddwv01.evnt_prod_track_log
+    WHERE ADVC_SALT_TYP = 'Advice Tool'
+      AND EVNT_DT > DATE '{wk_start.date()}' - 90
+""")
+
+logging.info("Transform: tracking_tool_use …")
+tracking_tool_use_distinct = (
+    tracking_all.loc[
+        tracking_all["OPPOR_ID"].notna() & tracking_all["ADVC_TOOL_NM"].notna(),
+        ["OPPOR_ID", "ADVC_TOOL_NM"],
+    ]
+    .assign(ADVC_TOOL_NM=lambda d: d["ADVC_TOOL_NM"].astype(str).str.upper())
+    .drop_duplicates()
+)
+
+tracking_count_tool_use_pre2 = (
+    tracking_tool_use_distinct
+    .groupby("OPPOR_ID", as_index=False)
+    .agg({"ADVC_TOOL_NM": "nunique"})
+    .rename(columns={"ADVC_TOOL_NM": "count_unique_tool_used"})
+    .sort_values("count_unique_tool_used", ascending=False)
+)
+
+tracking_tool_use = tracking_count_tool_use_pre2.assign(
+    tool_used=lambda d: np.where(d["count_unique_tool_used"] > 0, "Tool Used", None)
+)
+
+# ------------------------------------------------------------------------------
+# 2) C360 DETAIL (SQL UNCHANGED)
+# ------------------------------------------------------------------------------
+logging.info("Extract: c360_detail_pre …")
+c360_detail_pre = td_read_sql(f"""
+    SELECT c360.*,
+           emp.org_unt_no, emp.hr_posn_titl_en, emp.posn_strt_dt, emp.posn_end_dt, emp.occpt_job_cd
+    FROM ddwv01.evnt_prod_oppor AS c360
+    LEFT JOIN
+    (
+      SELECT c3.evnt_id,
+             e1.org_unt_no, e1.hr_posn_titl_en, e2.posn_strt_dt, e2.posn_end_dt, e1.occpt_job_cd
+      FROM ddwv01.evnt_prod_oppor AS c3
+      INNER JOIN ddwv01.emp AS e1
+          ON c3.rbc_oppor_own_id = e1.emp_id
+         AND c3.evnt_dt >= e1.captr_dt
+         AND c3.evnt_dt <  e1.chg_dt
+      INNER JOIN ddwv01.empl_reltn AS e2
+          ON c3.rbc_oppor_own_id = e2.emp_id
+         AND c3.evnt_dt >= e2.captr_dt
+         AND c3.evnt_dt <  e2.chg_dt
+    ) AS emp
+      ON emp.evnt_id = c360.evnt_id
+    WHERE c360.evnt_id IS NOT NULL
+      AND evnt_dt BETWEEN DATE '{wk_start.date()}' AND DATE '{wk_end.date()}'
+""")
+
+logging.info("Merge: add tool usage flag …")
+c360_detail = c360_detail_pre.merge(tracking_tool_use, how="left", on="OPPOR_ID")
+c360_detail["TOOL_USED"] = np.where(
+    c360_detail["tool_used"].isna(), "Tool Not Used", "Tool Used"
+)
+
+# ------------------------------------------------------------------------------
+# 3) AOT LINK (SQL UNCHANGED)
+# ------------------------------------------------------------------------------
+logging.info("Extract: aot_all_oppor …")
+aot_all_oppor = td_read_sql(f"""
+    SELECT oppor_id, COUNT(*) AS count_aot
+    FROM ddwv01.evnt_prod_aot
+    WHERE ess_src_evnt_dt BETWEEN DATE '{wk_start_min14.date()}' AND DATE '{wk_end.date()}'
+      AND oppor_id IS NOT NULL
+    GROUP BY 1
+""")
+aot_all_oppor_unique = aot_all_oppor[["OPPOR_ID"]].drop_duplicates()
+
+logging.info("Merge: link C360 with AOT …")
+c360_detail_link_aot = c360_detail.merge(
+    aot_all_oppor_unique.rename(columns={"OPPOR_ID": "aot_oppor_id"}),
+    how="left",
+    left_on="OPPOR_ID",
+    right_on="aot_oppor_id",
+)
+c360_detail_link_aot["C360_PDA_link_AOT"] = np.where(
+    (c360_detail_link_aot["PROD_CATG_NM"] == "Personal Accounts")
+    & (c360_detail_link_aot["aot_oppor_id"].notna()),
+    1,
+    0,
+)
+
+# ------------------------------------------------------------------------------
+# 4) FILTER FOR RISK PROTECTION + RETAIL (SAS LOGIC)
+# ------------------------------------------------------------------------------
+logging.info("Filter: c360_detail_more_in_pre …")
+cond = (
+    (c360_detail_link_aot["ASCT_PROD_FMLY_NM"] == "Risk Protection")
+    & (c360_detail_link_aot["LOB"] == "Retail")
+    & (c360_detail_link_aot["C360_PDA_link_AOT"] == 0)
+    & (c360_detail_link_aot["OPPOR_STAGE_NM"].isin(["Opportunity Won", "Opportunity Lost"]))
+)
+c360_detail_more_in_pre = c360_detail_link_aot.loc[cond].copy()
+
+# ------------------------------------------------------------------------------
+# 5) PA RATIONALE VALIDATION (SAS LOGIC)
+# ------------------------------------------------------------------------------
+logging.info("Evaluate: PA rationale …")
+rationale_src = c360_detail_more_in_pre.loc[
+    c360_detail_more_in_pre["IS_PROD_APRP_FOR_CLNT"] == "Not Appropriate - Rationale",
+    ["EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT"],
+].copy()
+
+if len(rationale_src):
+    rationale_eval = pd.concat(
+        [rationale_src, rationale_src["CLNT_RTNL_TXT"].apply(_flags)],
+        axis=1
+    )
+else:
+    rationale_eval = pd.DataFrame(columns=["EVNT_ID", "prod_not_aprp_rtnl_txt_cat"])
+
+C360_detail_more_in = c360_detail_more_in_pre.merge(
+    rationale_eval[["EVNT_ID", "prod_not_aprp_rtnl_txt_cat"]],
+    how="left",
+    on="EVNT_ID",
+)
+
+C360_detail_more_in["prod_not_aprp_rtnl_txt_cat"] = np.where(
+    C360_detail_more_in["IS_PROD_APRP_FOR_CLNT"].isna(),
+    "Not Available",
+    np.where(
+        C360_detail_more_in["IS_PROD_APRP_FOR_CLNT"] == "Not Appropriate - Rationale",
+        "Not Applicable",
+        C360_detail_more_in["prod_not_aprp_rtnl_txt_cat"],
+    ),
+)
+
+# ------------------------------------------------------------------------------
+# 6) LEVEL_OPPOR + FIRST ROW (SAS LOGIC)
+# ------------------------------------------------------------------------------
+logging.info("Deduplicate by OPPOR_ID …")
+tmp0 = C360_detail_more_in.sort_values(["OPPOR_ID", "EVNT_ID"]).copy()
+tmp0["level_oppor"] = tmp0.groupby("OPPOR_ID").cumcount() + 1
+tmp_pa_c360_4ac = tmp0.loc[tmp0["level_oppor"] == 1].copy()
+logging.info(f"tmp_pa_c360_4ac: {len(tmp_pa_c360_4ac):,} rows")
+
+# ------------------------------------------------------------------------------
+# 7) ASSESSMENT (RDE) – Autocomplete (SAS GROUP BY)
+# ------------------------------------------------------------------------------
+logging.info("Aggregate: tmp_pa_c360_ac_assessment …")
+aca = tmp_pa_c360_4ac.copy()
+aca["RegulatoryName"] = "C86"
+aca["LOB"] = "Retail"
+aca["ReportName"] = "C86 Client360 Product Appropriateness"
+aca["ControlRisk"] = "Completeness"
+aca["TestType"] = "Anomaly"
+aca["TestPeriod"] = "Origination"
+aca["ProductType"] = aca["PROD_CATG_NM"]
+aca["segment"] = "Account Open"
+aca["segment2"] = aca["ASCT_PROD_FMLY_NM"]
+aca["segment3"] = aca["PROD_SRVC_NM"]
+aca["segment4"] = aca["IS_PROD_APRP_FOR_CLNT"].map(map_pa_result)
+aca["segment5"] = aca["prod_not_aprp_rtnl_txt_cat"]
+aca["segment6"] = aca["OPPOR_STAGE_NM"]
+aca["segment7"] = aca["TOOL_USED"]
+aca["segment10"] = pd.to_datetime(aca["EVNT_DT"]).dt.strftime("%Y%m")
+aca["CommentCode"] = "COM13"
+aca["Comments"] = aca["CommentCode"].map(CS_CMT)
+aca["HoldoutFlag"] = "N"
+aca["SnapDate"] = end_of_week_sun(aca["EVNT_DT"])
+aca["DateCompleted"] = pd.to_datetime(date.today())
+
+grp1 = [
+    "RegulatoryName","LOB","ReportName","ControlRisk","TestType","TestPeriod","ProductType",
+    "segment","segment2","segment3","segment4","segment5","segment6","segment7","segment10",
+    "HoldoutFlag","CommentCode","Comments","DateCompleted","SnapDate"
+]
+
+tmp_pa_c360_ac_assessment = (
+    aca.assign(RDE="PA003_Client360_Completeness_RDE")
+       .groupby(grp1, dropna=False, as_index=False)
+       .agg(Volume=("EVNT_ID","size"))
+       .assign(Amount=np.nan)
+)
+
+# ------------------------------------------------------------------------------
+# 8) ASSESSMENT (COUNT BY TOOL NAME) – Autocomplete (SAS GROUP BY)
+# ------------------------------------------------------------------------------
+logging.info("Aggregate: tmp_pa_c360_ac_count_assessment …")
+tmp_pa_c360_4ac_count_pre = tmp_pa_c360_4ac.merge(
+    tracking_tool_use_distinct.assign(ADVC_TOOL_NM=lambda d: d["ADVC_TOOL_NM"].astype(str).str.upper()),
+    how="left", on="OPPOR_ID"
+)
+acc = tmp_pa_c360_4ac_count_pre.copy()
+acc["RegulatoryName"] = "C86"
+acc["LOB"] = "Retail"
+acc["ReportName"] = "C86 Client360 Product Appropriateness"
+acc["ControlRisk"] = "Completeness"
+acc["TestType"] = "Anomaly"
+acc["TestPeriod"] = "Origination"
+acc["ProductType"] = acc["PROD_CATG_NM"]
+acc["segment"] = "Account Open"
+acc["segment2"] = acc["ASCT_PROD_FMLY_NM"]
+acc["segment3"] = acc["PROD_SRVC_NM"]
+acc["segment4"] = acc["IS_PROD_APRP_FOR_CLNT"].map(map_pa_result)
+acc["segment5"] = acc["prod_not_aprp_rtnl_txt_cat"]
+acc["segment6"] = acc["OPPOR_STAGE_NM"]
+acc["segment7"] = acc["TOOL_USED"]
+acc["segment8"] = acc["ADVC_TOOL_NM"]
+acc["segment10"] = pd.to_datetime(acc["EVNT_DT"]).dt.strftime("%Y%m")
+acc["CommentCode"] = "COM13"
+acc["Comments"] = acc["CommentCode"].map(CS_CMT)
+acc["HoldoutFlag"] = "N"
+acc["SnapDate"] = end_of_week_sun(acc["EVNT_DT"])
+acc["DateCompleted"] = pd.to_datetime(date.today())
+
+grp2 = grp1[:-1] + ["segment8", "SnapDate"]  # insert segment8, keep SnapDate
+
+tmp_pa_c360_ac_count_assessment = (
+    acc.assign(RDE="PA003_Client360_Completeness_Tool")
+       .groupby(grp2, dropna=False, as_index=False)
+       .agg(Volume=("EVNT_ID","size"))
+       .assign(Amount=np.nan)
+)
+
+# ------------------------------------------------------------------------------
+# 9) COMBINE + EXPORTS (Autocomplete, Detail, Pivot)
+# ------------------------------------------------------------------------------
+logging.info("Combine: autocomplete datasets …")
+tmplat_cols = [
+    "RegulatoryName","LOB","ReportName","ControlRisk","TestType","TestPeriod","ProductType","RDE",
+    "segment","segment2","segment3","segment4","segment5","segment6","segment7","segment8",
+    "segment9","segment10","HoldoutFlag","CommentCode","Comments","DateCompleted","SnapDate","Volume","Amount"
+]
+tmplat_ac = pd.DataFrame(columns=tmplat_cols)
+
+pa_c360_autocomplete_tool_use = pd.concat([tmplat_ac.iloc[0:0], tmp_pa_c360_ac_assessment], ignore_index=True)
+pa_c360_autocomplete_Count_Tool = pd.concat([tmplat_ac.iloc[0:0], tmp_pa_c360_ac_count_assessment], ignore_index=True)
+
+combine_pa_autocomplete = pd.concat(
+    [pa_c360_autocomplete_Count_Tool, pa_c360_autocomplete_tool_use],
+    ignore_index=True
+)
+
+outdir = "./out"
+excel_autocomplete = f"{outdir}/pa_client360_autocomplete.xlsx"
+excel_detail = f"{outdir}/pa_client360_detail_{runday}.xlsx"
+excel_pivot = f"{outdir}/PA_Client360_Pivot.xlsx"
+
+logging.info("Export: pa_client360_autocomplete.xlsx …")
+combine_pa_autocomplete.to_excel(excel_autocomplete, sheet_name="autocomplete", index=False)
+
+logging.info("Build + Export: detail …")
+detail_src = tmp_pa_c360_4ac_count_pre.copy()
+detail_src["PA_result"] = detail_src["IS_PROD_APRP_FOR_CLNT"].map(map_pa_result)
+detail = detail_src.loc[
+    detail_src["PA_result"].isin(
+        ["Product Not Appropriate", "Missing", "Product Appropriateness assessed outside Client 360"]
+    )
+].copy()
+
+detail_out = pd.DataFrame({
+    "event_month": pd.to_datetime(detail["EVNT_DT"]).dt.strftime("%Y%m"),
+    "reporting_date": pd.to_datetime(pd.Timestamp.today()).strftime("%m/%d/%Y"),
+    "event_week_ending": end_of_week_sun(detail["EVNT_DT"]).dt.strftime("%m/%d/%Y"),
+    "event_date": pd.to_datetime(detail["EVNT_DT"]).dt.strftime("%m/%d/%Y"),
+    "event_timestamp": pd.to_datetime(detail["EVNT_TMSTMP"], errors="coerce"),
+    "opportunity_id": detail["OPPOR_ID"],
+    "opportunity_type": detail["OPPOR_REC_TYP"],
+    "product_code": detail["PROD_CD"],
+    "product_category_name": detail["PROD_CATG_NM"],
+    "product_family_name": detail["ASCT_PROD_FMLY_NM"],
+    "product_name": detail["PROD_SRVC_NM"],
+    "oppor_stage_nm": detail["OPPOR_STAGE_NM"],
+    "tool_used": detail["tool_used"],
+    "tool_nm": detail["ADVC_TOOL_NM"],
+    "PA_result": detail["PA_result"],
+    "PA_rationale": detail["CLNT_RTNL_TXT"],
+    "PA_rationale_validity": detail["prod_not_aprp_rtnl_txt_cat"],
+    "employee_id": detail["RBC_OPPOR_OWN_ID"],
+    "job_code": detail["OCCPT_JOB_CD"],
+    "position_title": detail["HR_POSN_TITL_EN"],
+    "employee_transit": detail["ORG_UNT_NO"],
+    "position_start_date": pd.to_datetime(detail["POSN_STRT_DT"], errors="coerce").dt.strftime("%m/%d/%Y"),
+})
+detail_out.to_excel(excel_detail, sheet_name="detail", index=False)
+logging.info(f"Wrote: {excel_detail}")
+
+logging.info("Export: PA_Client360_Pivot.xlsx …")
+combine_pa_autocomplete.to_excel(excel_pivot, sheet_name="Autocomplete", index=False)
+logging.info(f"Wrote: {excel_pivot}")
+
+logging.info("=== ETL Completed Successfully ===")
