@@ -1,0 +1,37 @@
+# --- ensure columns from c360_detail_link_aot are preserved fully ---
+expected_cols = [
+    "EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT", "ASCT_PROD_FMLY_NM",
+    "LOB", "C360_PDA_link_AOT", "OPPOR_STAGE_NM", "PROD_CATG_NM", "PROD_SRVC_NM",
+    "OPPOR_ID", "TOOL_USED", "EVNT_DT"
+]
+missing = [c for c in expected_cols if c not in c360_detail_link_aot.columns]
+if missing:
+    logging.warning(f"⚠️ Missing columns in c360_detail_link_aot: {missing}")
+
+# --- Apply same filter logic as SAS for 'c360_detail_more_in_pre' ---
+c360_detail_more_in_pre = c360_detail_link_aot.loc[
+    (c360_detail_link_aot["ASCT_PROD_FMLY_NM"] == "Risk Protection")
+    & (c360_detail_link_aot["LOB"] == "Retail")
+    & (c360_detail_link_aot["C360_PDA_link_AOT"] == 0)
+    & (c360_detail_link_aot["OPPOR_STAGE_NM"].isin(["Opportunity Won", "Opportunity Lost"]))
+].copy()
+
+# --- Retain all columns required downstream ---
+retain_cols = [
+    "EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT",
+    "ASCT_PROD_FMLY_NM", "LOB", "C360_PDA_link_AOT",
+    "OPPOR_STAGE_NM", "PROD_CATG_NM", "PROD_SRVC_NM",
+    "OPPOR_ID", "TOOL_USED", "EVNT_DT"
+]
+c360_detail_more_in_pre = c360_detail_more_in_pre[retain_cols].copy()
+
+# --- Maintain full dataset equivalent of c360_detail_more ---
+c360_detail_more = c360_detail_link_aot.copy()
+
+# --- Mirror SAS logic: create IO copy for rationale evaluation ---
+C360_detail_more_io = c360_detail_more_in_pre.copy()
+
+logging.info(f"c360_detail_more_in_pre: {len(c360_detail_more_in_pre):,} rows, "
+             f"{len(c360_detail_more_in_pre.columns)} cols")
+logging.info(f"C360_detail_more_io: {len(C360_detail_more_io):,} rows, "
+             f"{len(C360_detail_more_io.columns)} cols")
