@@ -1,0 +1,128 @@
+logging.info("Create volatile c360_short + select c360_detail_pre …")
+td_execute(f"""
+    CREATE MULTISET VOLATILE TABLE c360_short AS
+    (
+      SELECT evnt_id,
+             CAST(rbc_oppor_own_id AS INTEGER) AS emp_id,
+             evnt_dt AS snap_dt
+      FROM ddwv01.evnt_prod_oppor
+      WHERE rbc_oppor_own_id IS NOT NULL
+        AND evnt_dt IS NOT NULL
+        AND evnt_id IS NOT NULL
+        AND evnt_dt BETWEEN DATE '{wk_start.isoformat()}' AND DATE '{wk_end.isoformat()}'
+    )
+    WITH DATA
+    PRIMARY INDEX (emp_id, snap_dt)
+    ON COMMIT PRESERVE ROWS;
+""")
+td_execute("COLLECT STATISTICS COLUMN (emp_id, snap_dt) ON c360_short;")
+
+c360_detail_pre = td_read_sql(f"""
+    SELECT c360.*,
+           emp.org_unt_no, emp.hr_posn_titl_en, emp.posn_strt_dt, emp.posn_end_dt, emp.occpt_job_cd
+    FROM ddwv01.evnt_prod_oppor AS c360
+    LEFT JOIN
+    (
+      SELECT c3.evnt_id,
+             e1.org_unt_no, e1.hr_posn_titl_en, e2.posn_strt_dt, e2.posn_end_dt, e1.occpt_job_cd
+      FROM c360_short AS c3
+      INNER JOIN ddwv01.emp AS e1
+          ON c3.emp_id = e1.emp_id
+         AND c3.snap_dt >= e1.captr_dt
+         AND c3.snap_dt <  e1.chg_dt
+      INNER JOIN ddwv01.empl_reltn AS e2
+          ON c3.emp_id = e2.emp_id
+         AND c3.snap_dt >= e2.captr_dt
+         AND c3.snap_dt <  e2.chg_dt
+    ) AS emp
+      ON emp.evnt_id = c360.evnt_id
+    WHERE c360.evnt_id IS NOT NULL
+      AND evnt_dt BETWEEN DATE '{wk_start.isoformat()}' AND DATE '{wk_end.isoformat()}'
+""")
+
+c360_detail = c360_detail_pre.merge(tracking_tool_use, how="left", on="OPPOR_ID")
+c360_detail["TOOL_USED"] = np.where(c360_detail["tool_used"].isna(), "Tool Not Used", "Tool Used")
+
+
+# =============================================================================
+# 7) AOT link
+# =============================================================================
+
+logging.info("Extract: aot_all_oppor …")
+aot_all_oppor = td_read_sql(f"""
+    SELECT oppor_id, COUNT(*) AS count_aot
+    FROM ddwv01.evnt_prod_aot
+    WHERE ess_src_evnt_dt BETWEEN DATE '{wk_start_min14.isoformat()}' AND DATE '{wk_end.isoformat()}'
+      AND oppor_id IS NOT NULL
+    GROUP BY 1
+""")
+aot_all_oppor_unique = aot_all_oppor[["OPPOR_ID"]].drop_duplicates()
+
+c360_detail_link_aot = c360_detail.merge(
+    aot_all_oppor_unique.rename(columns={"OPPOR_ID": "aot_oppor_id"}),
+    how="left",
+    left_on="OPPOR_ID",
+    right_on="aot_oppor_id",
+)
+c360_detail_link_aot["C360_PDA_link_AOT"] = np.where(
+    (c360_detail_link_aot["PROD_CATG_NM"] == "Personal Accounts") &
+    (c360_detail_link_aot["aot_oppor_id"].notna()),
+    1, 0
+)
+
+
+# =============================================================================
+# 8) Detail filters + PA rationale flags
+# =============================================================================
+
+# c360_detail_more_in_pre subset
+cond = (
+    (c360_detail_link_aot["asct_prod_fmly_nm"] == "Risk Protection") &
+    (c360_detail_link_aot["lob"] == "Retail") &
+    (c360_detail_link_aot["C360_PDA_link_AOT"] == 0) &
+    (c360_detail_link_aot["oppor_stage_nm"].isin(["Opportunity Won", "Opportunity Lost"]))
+)
+c360_detail_more_in_pre = c360_detail_link_aot.loc[cond].copy()
+
+# Evaluate PA rationale (reproduce xfail_* rules)
+rationale_src = c360_detail_more_in_pre.loc[
+    c360_detail_more_in_pre["IS_PROD_APRP_FOR_CLNT"] == "Not Appropriate - Rationale",
+    ["EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT"],
+].copy()
+
+def _normalize_txt(x: str) -> str:
+    if x is None:
+        return ""
+    s = " ".join(str(x).split())
+    return s.upper().strip()
+
+def _flags(x: str):
+    s = _normalize_txt(x)
+    f1 = 0 if len(s) > 5 else 1
+    nz = s.replace(" ", "")
+    f2 = 0 if len(set(nz)) >= 2 else 1
+    f3 = 0 if sum(ch.isalnum() for ch in s) >= 2 else 1
+    cat = "Valid" if (f1 + f2 + f3) == 0 else "Invalid"
+    return pd.Series([f1, f2, f3, cat], index=["xfail_chars_gt5", "xfail_rep_char", "xfail_ge_2_alnum", "prod_not_aprp_rtnl_txt_cat"])
+
+if len(rationale_src):
+    rationale_eval = pd.concat([rationale_src, rationale_src["CLNT_RTNL_TXT"].apply(_flags)], axis=1)
+else:
+    rationale_eval = pd.DataFrame(columns=["EVNT_ID","prod_not_aprp_rtnl_txt_cat"])
+
+C360_detail_more_in = c360_detail_more_in_pre.merge(
+    rationale_eval[["EVNT_ID","prod_not_aprp_rtnl_txt_cat"]],
+    how="left", on="EVNT_ID"
+)
+C360_detail_more_in["prod_not_aprp_rtnl_txt_cat"] = np.where(
+    C360_detail_more_in["IS_PROD_APRP_FOR_CLNT"].isna(), "Not Available",
+    np.where(C360_detail_more_in["IS_PROD_APRP_FOR_CLNT"] == "Not Appropriate - Rationale", "Not Applicable",
+             C360_detail_more_in["prod_not_aprp_rtnl_txt_cat"])
+)
+
+# Dedup by OPPOR_ID and compute level_oppor (1-based like SAS post-increment)
+tmp0 = C360_detail_more_in.sort_values(["OPPOR_ID", "EVNT_ID"]).copy()
+tmp0["level_oppor"] = tmp0.groupby("OPPOR_ID").cumcount() + 1
+
+# Keep first per OPPOR_ID (level_oppor==1)
+tmp_pa_c360_4ac = tmp0.loc[tmp0["level_oppor"] == 1].copy()
