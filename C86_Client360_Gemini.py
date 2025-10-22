@@ -41,7 +41,7 @@ OUTPATH = Path("/home/a/b/c")
 # Setup logging paths based on OUTPATH
 LOGPATH = OUTPATH / "log" / "product_appropriateness" / "client360"
 YMD = datetime.now().strftime('%Y%m%d')
-LOG_FILE_NAME = f"CB6_pa_client360_{YMD}.log"
+LOG_FILE_NAME = f"C86_pa_client360_{YMD}.log"
 LOG_FILE = setup_logging(LOGPATH, LOG_FILE_NAME)
 
 logging.info(f"OUTPATH set to: {OUTPATH}")
@@ -193,7 +193,7 @@ PERSISTENT_AC_FILE = "pa_client360_autocomplete.parquet"
 
 try:
     logging.info("="*50)
-    logging.info("SAS to Python Migration: CB6_pa_client360 Starting...")
+    logging.info("SAS to Python Migration: C86_pa_client360 Starting...")
     logging.info(f"Script running as user: {os.environ.get('USER', 'Unknown')}")
     logging.info(f"Platform: {os.environ.get('HOSTNAME', 'Unknown')}")
     
@@ -371,7 +371,7 @@ try:
         c360_detail, 
         aot_all_oppor_unique, 
         left_on='OPPOR_ID', 
-        right_on='aot_oppor_id'
+        right_on='aot_oppor_id',
         how='left')
 
     cond_prod = c360_detail_link_aot['PROD_CATG_NM'] == 'Personal Accounts'
@@ -492,9 +492,9 @@ try:
     
     # Replicate the large data step assignment
     tmp_pa_c360_4ac = tmp_pa_c360_4ac.assign(
-        RegulatoryName='CB6',
+        RegulatoryName='C86',
         LOB='Retail',
-        ReportName='CB6 Client360 Product Appropriateness',
+        ReportName='C86 Client360 Product Appropriateness',
         ControlRisk='Completeness',
         TestType='Anomaly',
         TestPeriod='Origination',
@@ -526,6 +526,7 @@ try:
         'Product Appropriate': 'Product Appropriate'
     }
     df_agg['segment4'] = df_agg['IS_PROD_APRP_FOR_CLNT'].map(seg4_map).fillna('Missing')
+    df_agg['segment5'] = df_agg['prod_not_aprp_rtnl_txt_cat']
     df_agg['RDE'] = 'PA002_Client360_Completeness_RDE'
 
     group_by_cols = [
