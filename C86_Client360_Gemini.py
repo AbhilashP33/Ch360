@@ -295,7 +295,7 @@ try:
      AND  c3.snap_dt   >= e1.captr_dt
      AND  c3.snap_dt   <  e1.chg_dt
      INNER JOIN
-        ddwv01.emp1_reltn AS e2
+        ddwv01.empl_reltn AS e2
      ON   e2.emp_id      = c3.emp_id
      AND  c3.snap_dt   >= e2.captr_dt
      AND  c3.snap_dt   <  e2.chg_dt
@@ -361,30 +361,35 @@ try:
     logging.info(f"Loaded {len(aot_all_oppor)} rows into aot_all_oppor.")
     
     # --- 11. Process AOT Data (in-memory) ---
-    logging.info("Step 11: Processing AOT data...")
-    aot_all_oppor_unique = aot_all_oppor[['OPPOR_ID']].drop_duplicates()
-    logging.info(f"Created aot_all_oppor_unique: {len(aot_all_oppor_unique)} rows.")
+    aot_all_oppor_unique = aot_all_oppor[['OPPOR_ID']].drop_duplicates().copy()
+    aot_all_oppor_unique.rename(columns={'OPPOR_ID': 'aot_oppor_id'}, inplace=True)
+    logging.info(f"Created aot_all_oppor_unique: {len(aot_all_oppor_unique)} rows with column 'aot_oppor_id'.")
     
     # --- 12. Create c360_detail_link_aot ---
     logging.info("Step 12: Creating c360_detail_link_aot...")
     c360_detail_link_aot = pd.merge(
         c360_detail, 
         aot_all_oppor_unique, 
-        on='OPPOR_ID', 
-        how='left',
-        suffixes=('', '_aot') # Add suffix to the right-side 'oppor_id'
-    )
-    
-    # Replicate SAS alias: b.oppor_id as aot_oppor_id
-    c360_detail_link_aot = c360_detail_link_aot.rename(columns={'OPPOR_ID_aot': 'aot_oppor_id'})
-    
-    # Replicate SAS case statement:
-    # case when PROD_CATG_NM = 'Personal Accounts' and b.oppor_id is not missing then 1 else 0 end as C360_PDA_Link_AOT
+        left_on='OPPOR_ID', 
+        right_on='aot_oppor_id'
+        how='left')
+
     cond_prod = c360_detail_link_aot['PROD_CATG_NM'] == 'Personal Accounts'
     cond_aot = c360_detail_link_aot['aot_oppor_id'].notna()
     
     c360_detail_link_aot['C360_PDA_Link_AOT'] = np.where(cond_prod & cond_aot, 1, 0)
     logging.info(f"Created c360_detail_link_aot: {len(c360_detail_link_aot)} rows.")
+    
+    # Replicate SAS alias: b.oppor_id as aot_oppor_id
+    # c360_detail_link_aot = c360_detail_link_aot.rename(columns={'OPPOR_ID_aot': 'aot_oppor_id'})
+    
+    # Replicate SAS case statement:
+    # case when PROD_CATG_NM = 'Personal Accounts' and b.oppor_id is not missing then 1 else 0 end as C360_PDA_Link_AOT
+    # cond_prod = c360_detail_link_aot['PROD_CATG_NM'] == 'Personal Accounts'
+    # cond_aot = c360_detail_link_aot['aot_oppor_id'].notna()
+    
+    # c360_detail_link_aot['C360_PDA_Link_AOT'] = np.where(cond_prod & cond_aot, 1, 0)
+    # logging.info(f"Created c360_detail_link_aot: {len(c360_detail_link_aot)} rows.")
 
     # --- 13. Create c360_detail_more ---
     logging.info("Step 13: Filtering to c360_detail_more_in_pre...")
