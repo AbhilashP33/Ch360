@@ -567,7 +567,7 @@ try:
     
     logging.info(f"Created tmp_pa_C360_4ac_count: {len(tmp_pa_c360_4ac_count)} rows.")
     
-    # --- 21. Create Tool Count Assessment ---
+# --- 21. Create Tool Count Assessment ---
     logging.info("Step 21: Creating tool count assessment...")
     df_agg_count = tmp_pa_c360_4ac_count.copy()
     
@@ -580,14 +580,23 @@ try:
     }
     df_agg_count['segment4'] = df_agg_count['IS_PROD_APRP_FOR_CLNT'].map(seg4_map_count).fillna('Missing')
     df_agg_count['RDE'] = 'PA003_Client360_Completeness_Tool'
-
-    # Add segment8 to group by
-    group_by_cols_count = group_by_cols.copy()
-    group_by_cols_count.insert(group_by_cols.index('segment7') + 1, 'segment8') # Insert after segment7
     
-    # Fill NaN in group columns
+    # This is your fix - it's perfect
+    df_agg_count['segment5'] = df_agg_count['prod_not_aprp_rtnl_txt_cat']
+
+    # Define the final grouping list one time
+    group_by_cols_count = [
+        'RegulatoryName', 'ReportName', 'ControlRisk', 'TestType', 'TestPeriod', 
+        'ProductType', 'RDE', 'segment', 'segment2', 'segment3', 
+        'segment4', 'segment5', 'segment6', 'segment7', 'segment8', 
+        'segment10', 'HoldoutFlag', 'CommentCode', 'Comments', 
+        'datecompleted', 'snapdate'
+    ]
+    
+    # Fill NaNs one time
     df_agg_count[group_by_cols_count] = df_agg_count[group_by_cols_count].fillna('Missing')
     
+    # Group one time
     tmp_pa_c360_ac_count_assessment = df_agg_count.groupby(group_by_cols_count, dropna=False) \
                                                   .size().reset_index(name='Volume')
     
