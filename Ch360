@@ -84,7 +84,7 @@ def load_td_connection(json_filename: str) -> Dict[str, str]:
             raise ValueError(f"Missing '{k}' in {json_path}")
     return cfg
 
-
+"""
 class TDClient:
     """Simple Teradata client using teradatasql DB-API with a shared connection."""
 
@@ -106,7 +106,32 @@ class TDClient:
             self._conn.close()
         except Exception:
             pass
+"""
 
+class TDClient:
+    """Simple Teradata client using teradatasql DB-API with a shared connection."""
+
+    def __init__(self, host: str, user: str, password: str):
+        self._conn = teradatasql.connect(host=host, user=user, password=password)
+        logging.info("Connected to Teradata via teradatasql.")
+
+    def read_sql(self, name: str, sql: str, params: Optional[dict] = None) -> pd.DataFrame:
+        logging.debug(f"SQL[{name}]: {sql}")
+        if params:
+            df = pd.read_sql(sql, self._conn, params=params)
+        else:
+            df = pd.read_sql(sql, self._conn)
+
+        # Spec: uppercase cols + log
+        df.columns = df.columns.str.upper()
+        logging.info(f"{name}: {len(df):,} rows | Columns: {df.columns.tolist()}")
+        return df
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 def normalize_keys(df: pd.DataFrame, keys: List[str]) -> None:
     for k in keys:
