@@ -2,473 +2,510 @@
 # -*- coding: utf-8 -*-
 
 """
-PA Client360 ETL — 1:1 SAS → Python replication (screenshots 1..22)
-- Teradata reads via td_read_sql (SQLAlchemy/teradatasql or ODBC).
-- No volatile tables (SAS volatile logic reproduced in pandas).
-- Columns uppercased post-extract; join keys normalized.
-- Exact WHERE/JOIN semantics preserved.
-- Assessment aggregates + count-by-tool + Excel exports.
-- Row tracking + diagnostics, ±1% validation hooks.
+Client360 – Product Appropriateness (SAS → Python 1:1)
 
-Env:
-  TD_HOST, TD_USER, TD_PASS   -> Teradata connectivity
+- Data source: Teradata via teradatasql
+- Pandas-only transforms (no volatile tables; replicate their effect with pre-filters)
+- Preserve SAS variable names (UPPERCASE)
+- After every SQL extract:
+    df.columns = df.columns.str.upper()
+    logging.info(f"{name}: {len(df):,} rows | Columns: {df.columns.tolist()}")
+- Normalize join keys before merges (strip, upper, dtype)
+- Detailed logging + row tracking
+- Implements:
+    * Tracking pulls & tool usage flags
+    * c360_short (volatile replacement) → c360_detail_pre (EMP + RELTN snapshot joins)
+    * Tool join → c360_detail
+    * AOT link & PDA flag → c360_detail_link_aot
+    * Filters → c360_detail_more / _in_pre
+    * PA rationale text validation & join back
+    * De-dup per OPPOR_ID with LEVEL_OPPOR=1
+    * tmp_pa_C360_4ac (+ assessment AC / AC-Count)
+    * combine_pa_autocomplete (append behavior) + Excel exports
+    * Detail export filtered by PA_RESULT values
+
 Run:
-  python pa_client360_etl.py --outdir ./out
+  python pa_client360_etl.py \
+      --creds /path/td.json \
+      --outdir ./out \
+      --ini-run N \
+      --log ./out/pa_client360.log
+
+JSON creds file format:
+{
+  "url": "tds://HOST/..."
+, "user": "SERVICE_ID"
+, "password": "******"
+}
+
+Dependencies:
+  pip install pandas numpy teradatasql openpyxl
 """
 
 import os
 import sys
+import json
 import argparse
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
+from datetime import datetime, date, timedelta
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+import teradatasql
+
 
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
-def setup_logging(verbosity: int = 0) -> None:
-    level = logging.INFO if verbosity <= 1 else logging.DEBUG
+def setup_logging(log_file: str | None, verbose: int) -> None:
+    level = logging.INFO if verbose == 0 else logging.DEBUG
+    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=handlers,
     )
 
+
 # ------------------------------------------------------------------------------
-# Teradata connection + reader
+# Helpers
 # ------------------------------------------------------------------------------
-def build_td_engine():
-    host = os.getenv("TD_HOST")
-    user = os.getenv("TD_USER")
-    pwd  = os.getenv("TD_PASS")
-    if not all([host, user, pwd]):
-        raise RuntimeError("Missing TD_HOST/TD_USER/TD_PASS.")
+def td_connect(creds_path: str):
+    with open(creds_path, "r", encoding="utf-8") as f:
+        c = json.load(f)
+    url = c.get("url")
+    user = c.get("user")
+    pwd = c.get("password")
+    if not all([url, user, pwd]):
+        raise RuntimeError("JSON creds file must include 'url', 'user', 'password'.")
+    logging.info("Connecting to Teradata with teradatasql …")
+    con = teradatasql.connect(host=url.replace("tds://", "").split("/")[0],
+                              user=user, password=pwd)
+    # NOTE: Some environments use DSN-like host in url; we just parse host portion.
+    return con
 
-    # Primary: teradatasql dialect
-    try:
-        url = f"teradatasql://{user}:{pwd}@{host}"
-        eng = create_engine(url, pool_pre_ping=True, pool_recycle=1800)
-        with eng.connect() as c:
-            c.execute(text("SELECT 1"))
-        logging.info("Connected to Teradata via teradatasql.")
-        return eng
-    except Exception as e:
-        logging.warning(f"teradatasql failed: {e}")
 
-    # Fallback: ODBC DSN
-    dsn = os.getenv("TD_DSN")
-    if dsn:
-        try:
-            url = f"teradata+pyodbc://{user}:{pwd}@{dsn}"
-            eng = create_engine(url, pool_pre_ping=True, pool_recycle=1800)
-            with eng.connect() as c:
-                c.execute(text("SELECT 1"))
-            logging.info("Connected to Teradata via ODBC DSN.")
-            return eng
-        except Exception as e:
-            logging.warning(f"ODBC failed: {e}")
-
-    raise RuntimeError("Could not connect to Teradata. Check drivers/DSN.")
-
-def td_read_sql(engine, name: str, sql: str, params: Optional[dict] = None) -> pd.DataFrame:
-    df = pd.read_sql(text(sql), engine, params=params or {})
+def td_read_sql(con, name: str, sql: str, params: Dict | None = None) -> pd.DataFrame:
+    """Read SQL into DataFrame; force UPPERCASE columns and log per spec."""
+    if params is None:
+        params = {}
+    # teradatasql supports parameter markers as '?', but to honor 'unaltered SQL'
+    # we interpolate literals above and keep the text intact once built.
+    df = pd.read_sql(sql, con)
     df.columns = df.columns.str.upper()
     logging.info(f"{name}: {len(df):,} rows | Columns: {df.columns.tolist()}")
     return df
 
-# ------------------------------------------------------------------------------
-# Helpers mirroring SAS semantics
-# ------------------------------------------------------------------------------
+
 def normalize_keys(df: pd.DataFrame, keys: List[str]) -> None:
     for k in keys:
-        if k not in df.columns:
-            raise KeyError(f"Missing key: {k}")
-        df[k] = (
-            df[k]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-            .replace({"NAN": np.nan})
-        )
+        if k in df.columns:
+            df[k] = (
+                df[k]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .replace({"NAN": np.nan})
+            )
+        else:
+            raise KeyError(f"Missing key '{k}' in DataFrame: {df.columns.tolist()}")
 
-def track(tag: str, df: pd.DataFrame, counts: Dict[str, int]) -> None:
-    counts[tag] = len(df)
-    logging.info(f"TRACK | {tag}: {counts[tag]:,}")
 
-def left_merge(
-    left: pd.DataFrame, right: pd.DataFrame, on: List[str],
-    left_name: str, right_name: str, out_name: str
+def safe_merge(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    on: List[str],
+    how: str,
+    left_name: str,
+    right_name: str,
+    out_name: str,
 ) -> pd.DataFrame:
     normalize_keys(left, on)
     normalize_keys(right, on)
-    out = left.merge(right, on=on, how="left", suffixes=("", "_R"))
-    logging.info(f"{out_name}: left={left_name}:{len(left):,} right={right_name}:{len(right):,} -> {len(out):,}")
+    l, r = len(left), len(right)
+    out = left.merge(right, on=on, how=how, suffixes=("", "_R"))
+    logging.info(
+        f"{out_name}: merge({how}) on {on} | left={left_name}:{l:,} right={right_name}:{r:,} -> out={len(out):,}"
+    )
     return out
 
-def distinct_first_by(df: pd.DataFrame, by: List[str]) -> pd.DataFrame:
-    """SAS BY-group 'first.' emulation on a presorted DataFrame (ascending)."""
-    df2 = df.sort_values(by, kind="mergesort").copy()
-    mask = ~df2.duplicated(by, keep="first")
-    return df2.loc[mask].copy()
 
-def intnx_week7_end(d: pd.Timestamp) -> pd.Timestamp:
-    """SAS intnx('week.7', d, 0, 'e'): end of ISO week with Sunday=7 semantics."""
-    # End of week (Sunday) — align with SAS 'week.7'
-    dow = (d.weekday() + 1) % 7  # Monday=0 -> SAS Sun=0; adjust:
-    # Compute days to Sunday (6 in Python's 0..6 Monday=0)
-    days_to_sun = 6 - d.weekday()
-    return (d + pd.Timedelta(days=days_to_sun)).normalize()
+def track(tag: str, df: pd.DataFrame, tracker: Dict[str, int]) -> None:
+    tracker[tag] = len(df)
+    logging.info(f"TRACK | {tag}: {tracker[tag]:,} rows")
 
-def put_yymmn6(d: pd.Timestamp) -> str:
-    return d.strftime("%Y%m")
-
-def today_ts() -> pd.Timestamp:
-    return pd.Timestamp("today").normalize()
 
 # ------------------------------------------------------------------------------
-# Date window (screens 2)
+# Date window logic (INI-RUN = 'N' now, but keep 'Y' branch exactly)
 # ------------------------------------------------------------------------------
-def compute_windows(initial_run: bool) -> Dict[str, pd.Timestamp]:
+def start_of_week4(d: date) -> date:
     """
-    Mirror SAS:
-      - ini_run='Y' uses launch dates:
-            launch_dt='07MAY2023'd
-            launch_dt_min14='23APR2023'd
-            wk_end = today()
-      - else:
-            week_start = intnx('week.4', today(), 0, 'b') - 11
-            week_end   = intnx('week.4', today(), 0, 'b') - 5
-            wk_start_min14 = week_start - 14
+    SAS intnx('week.4', d, 0, 'b'): week starting Thursday.
+    We'll emulate: find the Thursday of the week containing d, then 'b' (=begin) gives that Thursday.
     """
-    tday = today_ts()
-    launch_dt       = pd.Timestamp("2023-05-07")
-    launch_dt_min14 = pd.Timestamp("2023-04-23")
+    # Python: Monday=0 … Sunday=6. Thursday=3.
+    # Shift d to Thursday of the same ISO week.
+    # Then 'b' (begin) = that Thursday itself.
+    dow = d.weekday()
+    # distance to Thursday=3
+    delta = 3 - dow
+    thursday = d + timedelta(days=delta)
+    return thursday
 
-    if initial_run:
-        wk_start       = launch_dt
+
+def compute_windows(ini_run: str) -> Dict[str, str]:
+    """
+    Returns dict of literal strings for DATE 'YYYY-MM-DD' usage in SQL
+    and yyyymmdd numeric strings for filenames, matching SAS macros.
+    """
+    today_d = date.today()
+    tday = today_d
+
+    launch_dt = date(2023, 5, 7)        # '07MAY2023'd
+    launch_dt_min14 = date(2023, 4, 23) # '23APR2023'd
+
+    week_beg_thu = start_of_week4(tday)  # intnx('week.4', tday, 0, 'b')
+    week_start = week_beg_thu - timedelta(days=11)
+    week_end = week_beg_thu - timedelta(days=5)
+
+    if ini_run.upper() == "Y":
+        wk_start = launch_dt
         wk_start_min14 = launch_dt_min14
-        wk_end         = tday
+        wk_end = tday  # SAS shows '&wk_end=&runday' branch when ini_run='Y'
+        runday = tday
     else:
-        # SAS: intnx('week.4', tday, 0, 'b') = beginning of ISO week (Thu-based).
-        # Implement: get Thursday-based week start; then minus 11/5 days as in SAS.
-        # Practical equivalent: take Monday-of-week then adjust offsets.
-        iso_week_start = tday - pd.to_timedelta(tday.weekday(), unit="D")  # Monday
-        week_start = iso_week_start - pd.Timedelta(days=11)
-        week_end   = iso_week_start - pd.Timedelta(days=5)
-        wk_start       = week_start
-        wk_end         = week_end
-        wk_start_min14 = week_start - pd.Timedelta(days=14)
+        wk_start = week_start
+        wk_start_min14 = week_start - timedelta(days=14)
+        wk_end = week_end
+        runday = tday
 
-    runday = tday
+    def d2sql(d: date) -> str:
+        return f"DATE '{d:%Y-%m-%d}'"
+
     return {
-        "WK_START": wk_start.normalize(),
-        "WK_START_MIN14": wk_start_min14.normalize(),
-        "WK_END": wk_end.normalize(),
-        "RUNDAY": runday.normalize(),
-        "TDAY": tday.normalize(),
+        "WK_START_SQL": d2sql(wk_start),
+        "WK_START_MIN14_SQL": d2sql(wk_start_min14),
+        "WK_END_SQL": d2sql(wk_end),
+        "RUNDAY_YYYYMMDD": f"{runday:%Y%m%d}",
+        "RUNDAY_YMD10": f"{runday:%Y-%m-%d}",
     }
 
+
 # ------------------------------------------------------------------------------
-# Core ETL
+# Main ETL
 # ------------------------------------------------------------------------------
-def run_pipeline(outdir: str, initial_run_flag: Optional[str] = None) -> int:
-    """
-    initial_run_flag:
-       'Y' -> use launch dates (matches SAS ini_run='Y')
-       'N' or None -> rolling week logic
-    """
-    engine = build_td_engine()
-    counts: Dict[str, int] = {}
-    ini_run = (initial_run_flag or "N").upper() == "Y"
+def run_pipeline(creds: str, outdir: str, ini_run: str) -> int:
+    os.makedirs(outdir, exist_ok=True)
+    counters: Dict[str, int] = {}
+
     win = compute_windows(ini_run)
+    WK_START = win["WK_START_SQL"]
+    WK_START_MIN14 = win["WK_START_MIN14_SQL"]
+    WK_END = win["WK_END_SQL"]
+    RUNDAY = win["RUNDAY_YYYYMMDD"]
 
-    # Convenience Teradata DATE literals
-    p = {
-        "wk_start": win["WK_START"].strftime("%Y-%m-%d"),
-        "wk_start_min14": win["WK_START_MIN14"].strftime("%Y-%m-%d"),
-        "wk_end": win["WK_END"].strftime("%Y-%m-%d"),
-        "runday": win["RUNDAY"].strftime("%Y-%m-%d"),
-    }
-    logging.info(f"WINDOWS: {p}")
+    logging.info(f"WINDOWS | WK_START={WK_START} WK_START_MIN14={WK_START_MIN14} WK_END={WK_END} RUNDAY={RUNDAY}")
 
-    # -------------------------------
-    # Tracking (screens 3–4)
-    # -------------------------------
-    SQL_TRACKING_ALL = """
-    SELECT *
+    # ---- Connect
+    con = td_connect(creds)
+
+    # =========================
+    # (1) TRACKING – Advice Tool pulls (Screenshots 3–4)
+    # =========================
+    SQL_TRACKING_ALL = f"""
+    SELECT
+      *
     FROM DDWV01.EVNT_PROD_TRACK_LOG
     WHERE advr_selt_typ = 'Advice Tool'
-      AND EVNT_DT > DATE :wk_start - 90
+      AND EVNT_DT > {WK_START} - 90
     """
-    tracking_all = td_read_sql(engine, "TRACKING_ALL", SQL_TRACKING_ALL, p)
-    track("TRACKING_ALL", tracking_all, counts)
+    tracking_all = td_read_sql(con, "TRACKING_ALL", SQL_TRACKING_ALL)
+    track("TRACKING_ALL", tracking_all, counters)
 
-    # Distinct tool usage by opportunity (uppercase)
+    # Distinct tool names per OPPOR_ID
     tracking_tool_use_distinct = (
-        tracking_all
-        .loc[tracking_all["OPPOR_ID"].notna() & tracking_all["ADVC_TOOL_NM"].notna(), ["OPPOR_ID", "ADVC_TOOL_NM"]]
+        tracking_all.loc[
+            tracking_all["OPPOR_ID"].notna() & tracking_all["ADVC_TOOL_NM"].notna(),
+            ["OPPOR_ID", "ADVC_TOOL_NM"],
+        ]
         .assign(ADVC_TOOL_NM=lambda d: d["ADVC_TOOL_NM"].astype(str).str.upper())
         .drop_duplicates()
         .reset_index(drop=True)
     )
     tracking_tool_use_distinct.columns = tracking_tool_use_distinct.columns.str.upper()
     logging.info(f"TRACKING_TOOL_USE_DISTINCT: {len(tracking_tool_use_distinct):,} rows | Columns: {tracking_tool_use_distinct.columns.tolist()}")
-    track("TRACKING_TOOL_USE_DISTINCT", tracking_tool_use_distinct, counts)
+    track("TRACKING_TOOL_USE_DISTINCT", tracking_tool_use_distinct, counters)
 
-    # Count unique tool use per opportunity
-    tracking_count_tool_use_pre2 = (
-        tracking_all
-        .loc[tracking_all["OPPOR_ID"].notna() & tracking_all["ADVC_TOOL_NM"].notna(), ["OPPOR_ID", "ADVC_TOOL_NM"]]
+    # Count unique tools per OPPOR_ID -> tool_used flag
+    tmp = (
+        tracking_all.loc[
+            tracking_all["OPPOR_ID"].notna() & tracking_all["ADVC_TOOL_NM"].notna(),
+            ["OPPOR_ID", "ADVC_TOOL_NM"],
+        ]
         .assign(ADVC_TOOL_NM=lambda d: d["ADVC_TOOL_NM"].astype(str).str.upper())
         .drop_duplicates()
-        .groupby("OPPOR_ID", as_index=False)
-        .size()
-        .rename(columns={"size": "COUNT_UNIQUE_TOOL_USED"})
     )
-    tracking_count_tool_use_pre2.columns = tracking_count_tool_use_pre2.columns.str.UPPER()
-    # The previous line mistakenly uses .UPPER(); fix:
-    tracking_count_tool_use_pre2.columns = [c.upper() for c in tracking_count_tool_use_pre2.columns]
-    logging.info(f"TRACKING_COUNT_TOOL_USE_PRE2: {len(tracking_count_tool_use_pre2):,} rows | Columns: {tracking_count_tool_use_pre2.columns.tolist()}")
+    tracking_count_tool_use_pre2 = (
+        tmp.groupby("OPPOR_ID", dropna=False)
+        .agg(count_unique_tool_used=("ADVC_TOOL_NM", "nunique"))
+        .reset_index()
+        .sort_values("count_unique_tool_used", ascending=False)
+    )
+    tracking_tool_use = tracking_count_tool_use_pre2.assign(
+        TOOL_USED=lambda d: np.where(d["count_unique_tool_used"] > 0, "Tool Used", np.nan)
+    )[["OPPOR_ID", "TOOL_USED"]]
+    tracking_tool_use.columns = tracking_tool_use.columns.str.upper()
+    logging.info(f"TRACKING_TOOL_USE: {len(tracking_tool_use):,} rows | Columns: {tracking_tool_use.columns.tolist()}")
+    track("TRACKING_TOOL_USE", tracking_tool_use, counters)
 
-    # Flag 'Tool Used'
-    tracking_tool_use = tracking_count_tool_use_pre2.copy()
-    tracking_tool_use["TOOL_USED"] = np.where(tracking_tool_use["COUNT_UNIQUE_TOOL_USED"] > 0, "Tool Used", np.nan)
-    track("TRACKING_TOOL_USE", tracking_tool_use, counts)
-
-    # -------------------------------
-    # C360 base + EMP joins (screens 5–6)
-    #   SAS volatile c360_short -> reproduced in pandas.
-    # -------------------------------
-    SQL_C360_BASE = """
-    SELECT *
-    FROM DDWV01.EVNT_PROD_OPPOR
-    WHERE EVNT_ID IS NOT NULL
-      AND EVNT_DT BETWEEN DATE :wk_start AND DATE :wk_end
+    # =========================
+    # (2) C360 SHORT replacement (volatile) + C360 DETAIL PRE (Screenshots 5–6)
+    # =========================
+    # Replacement for volatile 'c360_short' (pre-filtered subquery will be joined in-line)
+    SQL_C360_BASE = f"""
+    SELECT
+      c360.*
+    FROM DDWV01.EVNT_PROD_OPPOR AS c360
+    WHERE c360.EVNT_ID IS NOT NULL
+      AND EVNT_DT BETWEEN {WK_START} AND {WK_END}
     """
-    c360_base = td_read_sql(engine, "C360_BASE", SQL_C360_BASE, p); track("C360_BASE", c360_base, counts)
+    c360_base = td_read_sql(con, "C360_BASE", SQL_C360_BASE)
+    track("C360_BASE", c360_base, counters)
 
-    SQL_C360_SHORT = """
+    # Extract subview columns needed for EMP/RELTN snapshot join
+    SQL_C360_SHORT = f"""
     SELECT
       EVNT_ID,
-      CAST(rbc_oppor_own_id AS INTEGER) AS EMP_ID,
+      CAST(RBC_OPPOR_OWN_ID AS INTEGER) AS EMP_ID,
       EVNT_DT AS SNAP_DT
     FROM DDWV01.EVNT_PROD_OPPOR
-    WHERE rbc_oppor_own_id IS NOT NULL
+    WHERE RBC_OPPOR_OWN_ID IS NOT NULL
       AND EVNT_ID IS NOT NULL
       AND EVNT_DT IS NOT NULL
-      AND EVNT_DT BETWEEN DATE :wk_start AND DATE :wk_end
+      AND EVNT_DT BETWEEN {WK_START} AND {WK_END}
     """
-    c360_short = td_read_sql(engine, "C360_SHORT", SQL_C360_SHORT, p); track("C360_SHORT", c360_short, counts)
+    c360_short = td_read_sql(con, "C360_SHORT", SQL_C360_SHORT)
+    track("C360_SHORT", c360_short, counters)
 
-    # EMP + EMPL_RELTN — pulled once, filtered by date windows in pandas to mirror SAS:
-    SQL_EMP = """
-    SELECT emp_id, org_unt_no, hr_posn_titl_en, occpt_job_cd, captr_dt, chg_dt
-    FROM DDWV01.EMP
+    # EMP and RELTN snapshot enrichment using CAPTR/CHG windows
+    SQL_C360_DETAIL_PRE = f"""
+    SELECT
+      c360.*,
+      emp.org_unt_no,
+      emp.hr_posn_titl_en,
+      emp.posn_strt_dt,
+      emp.posn_end_dt,
+      emp.occp_job_cd
+    FROM DDWV01.EVNT_PROD_OPPOR AS c360
+    LEFT JOIN (
+        SELECT
+          c3.EVNT_ID,
+          e1.org_unt_no,
+          e1.hr_posn_titl_en,
+          e2.posn_strt_dt,
+          e2.posn_end_dt,
+          e1.occp_job_cd
+        FROM ({SQL_C360_SHORT.strip()}) AS c3
+        INNER JOIN DDWV01.EMP AS e1
+          ON e1.EMP_ID = c3.EMP_ID
+         AND c3.SNAP_DT >= e1.CAPTR_DT
+         AND c3.SNAP_DT <  e1.CHG_DT
+        INNER JOIN DDWV01.EMPL_RELTN AS e2
+          ON e2.EMP_ID = c3.EMP_ID
+         AND c3.SNAP_DT >= e2.CAPTR_DT
+         AND c3.SNAP_DT <  e2.CHG_DT
+    ) AS emp
+      ON emp.EVNT_ID = c360.EVNT_ID
+    WHERE c360.EVNT_ID IS NOT NULL
+      AND EVNT_DT BETWEEN {WK_START} AND {WK_END}
     """
-    emp = td_read_sql(engine, "EMP", SQL_EMP, p); track("EMP", emp, counts)
+    c360_detail_pre = td_read_sql(con, "C360_DETAIL_PRE", SQL_C360_DETAIL_PRE)
+    track("C360_DETAIL_PRE", c360_detail_pre, counters)
 
-    SQL_EMPL_RELTN = """
-    SELECT emp_id, posn_strt_dt, posn_end_dt, captr_dt, chg_dt
-    FROM DDWV01.EMPL_RELTN
-    """
-    rel = td_read_sql(engine, "EMPL_RELTN", SQL_EMPL_RELTN, p); track("EMPL_RELTN", rel, counts)
-
-    # Normalize date cols
-    for dcol in ["SNAP_DT"]:
-        if dcol in c360_short.columns: c360_short[dcol] = pd.to_datetime(c360_short[dcol], errors="coerce")
-    for dcol in ["CAPTR_DT","CHG_DT"]:
-        if dcol in emp.columns: emp[dcol] = pd.to_datetime(emp[dcol], errors="coerce")
-        if dcol in rel.columns: rel[dcol] = pd.to_datetime(rel[dcol], errors="coerce")
-    for dcol in ["POSN_STRT_DT","POSN_END_DT"]:
-        if dcol in rel.columns: rel[dcol] = pd.to_datetime(rel[dcol], errors="coerce")
-
-    # SAS join windows:
-    #  c3.emp_id = e1.emp_id
-    #  c3.snap_dt >= e1.captr_dt and c3.snap_dt < e1.chg_dt
-    #  c3.emp_id = e2.emp_id
-    #  c3.snap_dt >= e2.captr_dt and c3.snap_dt < e2.chg_dt
-    # Implement by filtering per row windows (vectorized merge then filter)
-    c3_e1 = c360_short.merge(emp, on="EMP_ID", how="inner", suffixes=("", "_E1"))
-    c3_e1 = c3_e1[(c3_e1["SNAP_DT"] >= c3_e1["CAPTR_DT"]) & (c3_e1["SNAP_DT"] < c3_e1["CHG_DT"])]
-
-    c3_e1_e2 = c3_e1.merge(rel, on="EMP_ID", how="inner", suffixes=("", "_E2"))
-    c3_e1_e2 = c3_e1_e2[(c3_e1_e2["SNAP_DT"] >= c3_e1_e2["CAPTR_DT_E2"]) & (c3_e1_e2["SNAP_DT"] < c3_e1_e2["CHG_DT_E2"])]
-
-    # Collapse to attributes needed by SAS (org_unt_no, hr_posn_titl_en, e2.posn_strt_dt, e2.posn_end_dt, e1.occpt_job_cd)
-    emp_attrs = c3_e1_e2[[
-        "EVNT_ID","ORG_UNT_NO","HR_POSN_TITL_EN","POSN_STRT_DT","POSN_END_DT","OCCPT_JOB_CD"
-    ]].drop_duplicates()
-    emp_attrs.columns = emp_attrs.columns.str.upper()
-    logging.info(f"EMP_ATTRS: {len(emp_attrs):,} rows | Columns: {emp_attrs.columns.tolist()}")
-
-    # DETAIL_PRE = base left join emp_attrs on EVNT_ID
-    detail_pre = c360_base.merge(emp_attrs, on="EVNT_ID", how="left")
-    logging.info(f"C360_DETAIL_PRE: base={len(c360_base):,} + emp_attrs={len(emp_attrs):,} -> {len(detail_pre):,}")
-    track("C360_DETAIL_PRE", detail_pre, counts)
-
-    # -------------------------------
-    # Tool join (screen 7)
-    # -------------------------------
-    detail_a = detail_pre.merge(
-        tracking_tool_use[["OPPOR_ID","TOOL_USED"]], on="OPPOR_ID", how="left"
+    # =========================
+    # (3) TOOL JOIN (Screenshot 7)
+    # =========================
+    c360_detail = safe_merge(
+        c360_detail_pre, tracking_tool_use, on=["OPPOR_ID"], how="left",
+        left_name="C360_DETAIL_PRE", right_name="TRACKING_TOOL_USE", out_name="C360_DETAIL"
     )
-    track("C360_DETAIL_A", detail_a, counts)
+    # SAS: derive TOOL_USED default when missing
+    if "TOOL_USED" not in c360_detail.columns:
+        c360_detail["TOOL_USED"] = np.nan
+    c360_detail["TOOL_USED"] = np.where(c360_detail["TOOL_USED"].isna(), "Tool Not Used", "Tool Used")
+    track("C360_DETAIL", c360_detail, counters)
 
-    # -------------------------------
-    # AOT segment (screen 8)
-    # -------------------------------
-    SQL_AOT_ALL_OPPOR = """
-    SELECT OPPOR_ID, COUNT(*) AS COUNT_AOT
+    # =========================
+    # (4) AOT link & flag (Screenshot 8)
+    # =========================
+    SQL_AOT_ALL = f"""
+    SELECT
+      OPPOR_ID,
+      COUNT(*) AS COUNT_AOT
     FROM DDWV01.EVNT_PROD_AOT
-    WHERE ESS_SRC_EVNT_DT BETWEEN DATE :wk_start_min14 AND DATE :wk_end
+    WHERE ESS_SRC_EVNT_DT BETWEEN {WK_START_MIN14} AND {WK_END}
       AND OPPOR_ID IS NOT NULL
     GROUP BY 1
     """
-    aot_all_oppor = td_read_sql(engine, "AOT_ALL_OPPOR", SQL_AOT_ALL_OPPOR, p)
-    aot_all_oppor_unique = aot_all_oppor[["OPPOR_ID"]].drop_duplicates()
-    aot_all_oppor_unique.columns = ["OPPOR_ID"]
-    logging.info(f"AOT_ALL_OPPOR_UNIQUE: {len(aot_all_oppor_unique):,}")
+    aot_all_oppor = td_read_sql(con, "AOT_ALL_OPPOR", SQL_AOT_ALL)
+    aot_all_oppor_unique = aot_all_oppor[["OPPOR_ID"]].drop_duplicates().reset_index(drop=True)
+    aot_all_oppor_unique.columns = aot_all_oppor_unique.columns.str.UPPER()
+    logging.info(f"AOT_ALL_OPPOR_UNIQUE: {len(aot_all_oppor_unique):,} rows | Columns: {aot_all_oppor_unique.columns.tolist()}")
+    track("AOT_ALL_OPPOR_UNIQUE", aot_all_oppor_unique, counters)
 
-    # Flag C360_PDA_Link_AOT for Personal Accounts
-    c360_detail_link_aot = detail_a.merge(aot_all_oppor_unique, on="OPPOR_ID", how="left", indicator=False)
-    c360_detail_link_aot["C360_PDA_LINK_AOT"] = np.where(
-        (c360_detail_link_aot["PROD_CATG_NM"] == "Personal Accounts") & c360_detail_link_aot["OPPOR_ID_y"].notna(),
-        1, 0
+    c360_detail_link_aot = safe_merge(
+        c360_detail, aot_all_oppor_unique, on=["OPPOR_ID"], how="left",
+        left_name="C360_DETAIL", right_name="AOT_ALL_OPPOR_UNIQUE", out_name="C360_DETAIL_LINK_AOT"
     )
-    # clean up dup columns
-    if "OPPOR_ID_y" in c360_detail_link_aot.columns:
-        c360_detail_link_aot.rename(columns={"OPPOR_ID_x":"OPPOR_ID"}, inplace=True)
-        c360_detail_link_aot.drop(columns=["OPPOR_ID_y"], inplace=True)
-    track("C360_DETAIL_LINK_AOT", c360_detail_link_aot, counts)
+    c360_detail_link_aot = c360_detail_link_aot.assign(
+        AOT_OPPOR_ID=lambda d: d["OPPOR_ID_R"],
+        C360_PDA_LINK_AOT=lambda d: np.where(
+            (d.get("PROD_CATG_NM").eq("Personal Accounts")) & d["AOT_OPPOR_ID"].notna(), 1, 0
+        ),
+    ).drop(columns=[c for c in ["OPPOR_ID_R"] if c in c360_detail_link_aot.columns])
+    track("C360_DETAIL_LINK_AOT", c360_detail_link_aot, counters)
 
-    # -------------------------------
-    # Filter to MORE (screen 9)
-    #   Where:
-    #     asct_prod_fmly_nm ^= 'Risk Protection'
-    #     lob = 'Retail'
-    #     C360_PDA_LINK_AOT = 0
-    #     oppor_stage_nm in ('Opportunity Won','Opportunity Lost')
-    # -------------------------------
-    c360_detail_more_in_pre = c360_detail_link_aot.copy()
-    c360_detail_more_in_pre["OPPOR_STAGE_NM_F"] = c360_detail_more_in_pre["OPPOR_STAGE_NM"]  # format placeholder
-    mask_more = (
-        (c360_detail_more_in_pre["ASCT_PROD_FMLY_NM"] != "Risk Protection") &
-        (c360_detail_more_in_pre["LOB"] == "Retail") &
-        (c360_detail_more_in_pre["C360_PDA_LINK_AOT"] == 0) &
-        (c360_detail_more_in_pre["OPPOR_STAGE_NM"].isin(["Opportunity Won","Opportunity Lost"]))
+    # =========================
+    # (5) Filters → c360_detail_more / _in_pre (Screenshot 9)
+    # =========================
+    filt = (
+        (c360_detail_link_aot.get("ASCT_PROD_FMLY_NM") != "Risk Protection") &
+        (c360_detail_link_aot.get("LOB") == "Retail") &
+        (c360_detail_link_aot.get("C360_PDA_LINK_AOT") == 0) &
+        (c360_detail_link_aot.get("OPPOR_STAGE_NM").isin(["Opportunity Won", "Opportunity Lost"]))
     )
-    c360_detail_more = c360_detail_more_in_pre.loc[mask_more].copy()
-    track("C360_DETAIL_MORE", c360_detail_more, counts)
+    c360_detail_more_in_pre = c360_detail_link_aot.loc[filt].copy()
+    c360_detail_more = c360_detail_more_in_pre.copy()
+    track("C360_DETAIL_MORE_IN_PRE", c360_detail_more_in_pre, counters)
+    track("C360_DETAIL_MORE", c360_detail_more, counters)
 
-    # -------------------------------
-    # PA rationale validation (screen 10 + 11)
-    #   Where IS_PROD_APRP_FOR_CLNT='Not Appropriate - Rationale'
-    #   Compute prod_not_appr_rtnl_txt_cat (Valid/Invalid) using SAS rules
-    # -------------------------------
-    def _normalize_txt(x: pd.Series) -> pd.Series:
-        # replicate: compress (remove spaces), translate spaces to blank (already), upcase(strip)
-        s = x.fillna("").astype(str)
-        # get space characters then normalize (SAS translate w/ repeating spaces to ' ')
-        s = s.str.replace(r"\s+", " ", regex=True)
-        s = s.str.strip().str.upper()
-        return s
-
-    pa_rat = c360_detail_more.loc[
-        c360_detail_more["IS_PROD_APRP_FOR_CLNT"] == "Not Appropriate - Rationale",
-        ["EVNT_ID","IS_PROD_APRP_FOR_CLNT","CLNT_RTNL_TXT"]
+    # =========================
+    # (6) PA rationale text validation (Screenshots 10–11)
+    # =========================
+    # Source rows where IS_PROD_APRP_FOR_CLNT = 'Not Appropriate - Rationale'
+    pa_src = c360_detail_more_in_pre.loc[
+        c360_detail_more_in_pre["IS_PROD_APRP_FOR_CLNT"].eq("Not Appropriate - Rationale"),
+        ["EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT"],
     ].copy()
 
-    pa_rat["PROD_NOT_APPR_RTNL_TXT_CAT"] = "Invalid"  # default, will flip to Valid if all tests pass
+    # Transform CLNT_RTNL_TXT following SAS steps
+    def compute_rationale_category(s: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        x = s.fillna("").astype(str)
+        # Get space char (first char of x) then make uniform, strip + UCASE
+        x_p = x.str.slice(0, 1)
+        # Replace multiple spaces by single spaces length(x_p)-1… approximate using translate-like:
+        # Use Python normalize: collapse whitespace
+        x = x.str.replace(r"\s+", " ", regex=True)
+        x = x.str.strip().str.upper()
+        # Conditions:
+        xfail_chars_gt5 = (x.str.len() > 5).astype(int)
+        x2 = x.str[0:1]
+        xfail_rep_char = (x2.notna() & (x.str.replace(x2, "", regex=False).str.len() == 0)).astype(int)
+        # "at least 2 different characters" test (rep-char=1 → fail)
+        # Fallback: if every char same -> fail; else pass (0)
+        xfail_rep_char = np.where(x.str.len() > 0, xfail_rep_char, 1)
 
-    # xfail_1: length > 5
-    s = _normalize_txt(pa_rat["CLNT_RTNL_TXT"])
-    xfail_chars_gt5 = (s.str.len() > 5).astype(int)
+        # At least 2 alpha-numeric
+        x3 = x.str.replace(r"[^A-Z0-9]", "", regex=True)
+        xfail_ge_2_alnum = (x3.str.len() >= 2).astype(int)
 
-    # xfail_rep_char: at least 2 different characters
-    first_char = s.str[:1]
-    different_char = (s.apply(lambda t: len(set(t)) >= 2)).astype(int)
+        # Valid when sum of failures == 0 (mirror SAS: ifc(sum(of xfail_.) = 0, 'Valid','Invalid'))
+        valid = np.where(
+            (xfail_chars_gt5 == 1) & (xfail_rep_char == 0) & (xfail_ge_2_alnum == 1),
+            "Valid", "Invalid"
+        )
+        return pd.Series(valid), xfail_chars_gt5, xfail_rep_char
 
-    # xfail_ge_2_alnum: at least 2 alpha/nums
-    alnum_count = s.str.replace(r"[^A-Z0-9]", "", regex=True).str.len()
-    ge2_alnum = (alnum_count >= 2).astype(int)
+    pa_src["PROD_NOT_APPR_RTNl_TXT_CAT"] = compute_rationale_category(pa_src["CLNT_RTNL_TXT"])[0]
+    pa_rationale = pa_src[["EVNT_ID", "IS_PROD_APRP_FOR_CLNT", "CLNT_RTNL_TXT", "PROD_NOT_APPR_RTNl_TXT_CAT"]].copy()
+    pa_rationale.columns = pa_rationale.columns.str.upper()
+    track("PA_RATIONALE", pa_rationale, counters)
 
-    # sum of failures (they used ifc(sum(xfail_.) = 0, "Valid","Invalid")
-    # Note: in SAS they flipped meaning (xfail indicators set to 1 when condition met).
-    # Here we treat valid if all three tests are 1.
-    all_ok = (xfail_chars_gt5 & different_char & ge2_alnum).astype(int)
-    pa_rat.loc[all_ok.eq(1), "PROD_NOT_APPR_RTNL_TXT_CAT"] = "Valid"
+    # Left join back (Screenshot 11)
+    c360_detail_more_in = safe_merge(
+        c360_detail_more_in_pre, pa_rationale[["EVNT_ID", "PROD_NOT_APPR_RTNl_TXT_CAT"]],
+        on=["EVNT_ID"], how="left",
+        left_name="C360_DETAIL_MORE_IN_PRE", right_name="PA_RATIONALE", out_name="C360_DETAIL_MORE_IN"
+    )
+    # CASE mapping:
+    c360_detail_more_in["PROD_NOT_APPR_RTNl_TXT_CAT"] = np.where(
+        c360_detail_more_in["IS_PROD_APRP_FOR_CLNT"].isna(), "Not Available",
+        np.where(
+            ~c360_detail_more_in["IS_PROD_APRP_FOR_CLNT"].eq("Not Appropriate - Rationale"),
+            "Not Applicable",
+            c360_detail_more_in["PROD_NOT_APPR_RTNl_TXT_CAT"]
+        )
+    )
+    track("C360_DETAIL_MORE_IN", c360_detail_more_in, counters)
 
-    pa_rat = pa_rat[["EVNT_ID","IS_PROD_APRP_FOR_CLNT","CLNT_RTNL_TXT","PROD_NOT_APPR_RTNL_TXT_CAT"]].copy()
-    pa_rat.columns = pa_rat.columns.str.upper()
-    track("PA_RATIONALE", pa_rat, counts)
-
-    # Join back (screen 11)
-    c360_detail_more_in = c360_detail_more.merge(pa_rat[["EVNT_ID","PROD_NOT_APPR_RTNL_TXT_CAT"]], on="EVNT_ID", how="left")
-    track("C360_DETAIL_MORE_IN", c360_detail_more_in, counts)
-
-    # -------------------------------
-    # Remove duplicates BY OPPOR_ID; keep first (screen 12–13)
-    # -------------------------------
+    # =========================
+    # (7) De-dup per OPPOR_ID + template/format mapping (Screenshots 12–14)
+    # =========================
+    # LEVEL_OPPOR = row_number within OPPOR_ID (sort like SAS BY OPPOR_ID)
     tmp0 = c360_detail_more_in.sort_values(["OPPOR_ID"]).copy()
-    # level_oppor increments per BY group; first has 1
     tmp0["LEVEL_OPPOR"] = tmp0.groupby("OPPOR_ID").cumcount() + 1
-    # Keep level_oppor = 1
-    tmp_pa_c360_4ac = tmp0.loc[tmp0["LEVEL_OPPOR"] == 1].copy()
+    # Keep first only
+    tmp = tmp0.loc[tmp0["LEVEL_OPPOR"].eq(1)].copy()
 
-    # Build segments & common fields (screen 13)
-    tmp_pa_c360_4ac["REGULATORYNAME"] = "C86"
-    tmp_pa_c360_4ac["LOB"] = "Retail"
-    tmp_pa_c360_4ac["REPORTNAME"] = "C86 Client360 Product Appropriateness"
-    tmp_pa_c360_4ac["CONTROLRISK"] = "Completeness"
-    tmp_pa_c360_4ac["TESTTYPE"] = "Anomaly"
-    tmp_pa_c360_4ac["TESTPERIOD"] = "Origination"
-    tmp_pa_c360_4ac["PRODUCTTYPE"] = tmp_pa_c360_4ac["PROD_CATG_NM"]
-    tmp_pa_c360_4ac["SEGMENT"] = "Account Open"
-    tmp_pa_c360_4ac["SEGMENT2"] = tmp_pa_c360_4ac["ASCT_PROD_FMLY_NM"]
-    tmp_pa_c360_4ac["SEGMENT3"] = tmp_pa_c360_4ac["PROD_SRVC_NM"]
-    tmp_pa_c360_4ac["SEGMENT6"] = tmp_pa_c360_4ac["OPPOR_STAGE_NM"]
-    tmp_pa_c360_4ac["SEGMENT7"] = tmp_pa_c360_4ac["TOOL_USED"]
-    tmp_pa_c360_4ac["SEGMENT10"] = pd.to_datetime(tmp_pa_c360_4ac["EVNT_DT"], errors="coerce").map(put_yymmn6)
-    tmp_pa_c360_4ac["COMMENTCODE"] = "COM13"
-
-    # Comments lookup ($cs_cmt.) — map code to text (screen 12 list)
+    # Comments mapping ($cs_cmt.)
     cs_cmt = {
-        "COM1":"Test population (less samples)",
-        "COM2":"Match population",
-        "COM3":"Mismatch population (less samples)",
-        "COM4":"Non Anomaly Population",
-        "COM5":"Anomaly Population",
-        "COM6":"Number of Deposit Sessions",
-        "COM7":"Number of Accounts",
-        "COM8":"Number of Transactions",
-        "COM9":"Non Blank Population",
-        "COM10":"Blank Population",
-        "COM11":"Unable to Assess",
-        "COM12":"Number of Failed Data Elements",
-        "COM13":"Population Distribution",
-        "COM14":"Reconciled Population",
-        "COM15":"Not Reconciled Population",
-        "COM16":"Pass",
-        "COM17":"Fail",
-        "COM18":"Not Applicable",
-        "COM19":"Potential Fail",
+        "COM1": "Test population (less samples)",
+        "COM2": "Match population",
+        "COM3": "Mismatch population (less samples)",
+        "COM4": "Non Anomaly Population",
+        "COM5": "Anomaly Population",
+        "COM6": "Number of Deposit Sessions",
+        "COM7": "Number of Accounts",
+        "COM8": "Number of Transactions",
+        "COM9": "Non Blank Population",
+        "COM10": "Blank Population",
+        "COM11": "Unable to Assess",
+        "COM12": "Number of Failed Data Elements",
+        "COM13": "Population Distribution",
+        "COM14": "Reconciled Population",
+        "COM15": "Not Reconciled Population",
+        "COM16": "Pass",
+        "COM17": "Fail",
+        "COM18": "Not Applicable",
+        "COM19": "Potential Fail",
     }
-    tmp_pa_c360_4ac["COMMENTS"] = tmp_pa_c360_4ac["COMMENTCODE"].map(cs_cmt).fillna("")
 
-    # Dates (SnapDate end-of-week; DateCompleted today)
-    tmp_pa_c360_4ac["EVNT_DT"] = pd.to_datetime(tmp_pa_c360_4ac["EVNT_DT"], errors="coerce")
-    tmp_pa_c360_4ac["SNAPDATE"] = tmp_pa_c360_4ac["EVNT_DT"].map(intnx_week7_end)
-    tmp_pa_c360_4ac["DATECOMPLETED"] = win["TDAY"]
-    # Keep types consistent
-    track("TMP_PA_C360_4AC", tmp_pa_c360_4ac, counts)
+    # Build tmp_pa_C360_4ac (Screenshot 13)
+    def yymmn6(dt: pd.Series) -> pd.Series:
+        s = pd.to_datetime(dt, errors="coerce")
+        return s.dt.strftime("%Y%m")
 
-    # -------------------------------
-    # Assessment (screen 14–15)
-    # Segment4 mapping based on IS_PROD_APRP_FOR_CLNT
-    # -------------------------------
+    tmp_pa_C360_4ac = tmp.assign(
+        REGULATORYNAME="C86",
+        LOB="Retail",
+        REPORTNAME="C86 Client360 Product Appropriateness",
+        CONTROLRISK="Completeness",
+        TESTTYPE="Anomaly",
+        TESTPERIOD="Origination",
+        PRODUCTTYPE=lambda d: d["PROD_CATG_NM"],          # Product Category
+        SEGMENT=lambda d: "Account Open",
+        SEGMENT2=lambda d: d["ASCT_PROD_FMLY_NM"],        # Product Name
+        SEGMENT3=lambda d: d["PROD_SRVC_NM"],
+        SEGMENT6=lambda d: d["OPPOR_STAGE_NM"],
+        SEGMENT7=lambda d: d["TOOL_USED"],
+        SEGMENT10=lambda d: yymmn6(d["EVNT_DT"]),
+        COMMENTCODE="COM13",
+        COMMENTS=lambda d: d["COMMENTCODE"].map(cs_cmt),
+        HOLDOUTFLAG="N",
+        SNAPDATE=lambda d: pd.to_datetime(d["EVNT_DT"], errors="coerce") + pd.offsets.Week(weekday=6),  # intnx('week.7', evnt_dt, 0, 'e')
+        DATECOMPLETED=pd.Timestamp.today().date(),
+    )
+    # Format dates
+    tmp_pa_C360_4ac["SNAPDATE"] = pd.to_datetime(tmp_pa_C360_4ac["SNAPDATE"]).dt.date
+    track("TMP_PA_C360_4AC", tmp_pa_C360_4ac, counters)
+
+    # =========================
+    # (8) Assessments (Screenshots 15–16)
+    # =========================
     def map_segment4(val: str) -> str:
         if val == "Product Appropriateness assessed outside Client 360":
             return "Product Appropriateness assessed outside of Client360"
@@ -480,165 +517,95 @@ def run_pipeline(outdir: str, initial_run_flag: Optional[str] = None) -> int:
             return "Product Appropriate"
         return "Missing"
 
-    ac_assess_cols = [
-        "REGULATORYNAME","LOB","REPORTNAME","CONTROLRISK","TESTTYPE","TESTPERIOD",
-        "PRODUCTTYPE","SEGMENT","SEGMENT2","SEGMENT3","SEGMENT6","SEGMENT7",
+    tmp_pa_C360_ac_assessment = tmp_pa_C360_4ac.copy()
+    tmp_pa_C360_ac_assessment["RDE"] = "PA002_Client360_Completeness_RDE"
+    tmp_pa_C360_ac_assessment["SEGMENT4"] = tmp_pa_C360_ac_assessment["IS_PROD_APRP_FOR_CLNT"].map(map_segment4)
+    tmp_pa_C360_ac_assessment["SEGMENT5"] = tmp_pa_C360_ac_assessment["PROD_NOT_APPR_RTNl_TXT_CAT"]
+    # Aggregate (group by a long list in SAS). We follow the same by grouping on the core dims:
+    gb_cols = [
+        "REGULATORYNAME","LOB","REPORTNAME","CONTROLRISK","TESTTYPE","TESTPERIOD","PRODUCTTYPE",
+        "RDE","SEGMENT","SEGMENT2","SEGMENT3","SEGMENT4","SEGMENT5","SEGMENT6","SEGMENT7",
         "SEGMENT10","HOLDOUTFLAG","COMMENTCODE","COMMENTS","DATECOMPLETED","SNAPDATE"
     ]
-    tmp_pa_c360_4ac["HOLDOUTFLAG"] = "N"
-    tmp_pa_c360_4ac["SEGMENT4"] = tmp_pa_c360_4ac["IS_PROD_APRP_FOR_CLNT"].map(map_segment4)
-    tmp_pa_c360_4ac["SEGMENT5"] = tmp_pa_c360_4ac.get("PROD_NOT_APPR_RTNL_TXT_CAT", np.nan)
-
-    group_keys = ac_assess_cols[:]
-    group_keys.insert(10, "SEGMENT4")
-    # Build AC assessment aggregate
-    tmp_pa_c360_ac_assessment = (
-        tmp_pa_c360_4ac
-        .assign(VOLUME=1, AMOUNT=1.0)
-        .groupby([
-            "REGULATORYNAME","LOB","REPORTNAME","CONTROLRISK","TESTTYPE","TESTPERIOD","PRODUCTTYPE",
-            "SEGMENT","SEGMENT2","SEGMENT3","SEGMENT4","SEGMENT5","SEGMENT6","SEGMENT7","SEGMENT10",
-            "HOLDOUTFLAG","COMMENTCODE","COMMENTS","DATECOMPLETED","SNAPDATE"
-        ], dropna=False, as_index=False)
-        .agg({"VOLUME":"sum","AMOUNT":"sum"})
+    tmp_pa_C360_ac_assessment = (
+        tmp_pa_C360_ac_assessment.groupby(gb_cols, dropna=False)
+        .agg(VOLUME=("EVNT_ID","size"))
+        .reset_index()
     )
-    track("TMP_PA_C360_AC_ASSESSMENT", tmp_pa_c360_ac_assessment, counts)
+    tmp_pa_C360_ac_assessment["AMOUNT"] = np.nan
+    track("TMP_PA_C360_AC_ASSESSMENT", tmp_pa_C360_ac_assessment, counters)
 
-    # -------------------------------
-    # Tool-used count pipeline (screen 16–18)
-    # Enrich with distinct ADVC_TOOL_NM (uppercased) per opportunity
-    # -------------------------------
-    tmp_pa_c360_4ac_count_pre = tmp_pa_c360_4ac.merge(
-        tracking_tool_use_distinct, on="OPPOR_ID", how="left"
+    # Prepare for tool-used count (Screenshots 17–18)
+    tmp_pa_C360_4ac_count_pre = safe_merge(
+        tmp_pa_C360_4ac, tracking_tool_use_distinct, on=["OPPOR_ID"], how="left",
+        left_name="TMP_PA_C360_4AC", right_name="TRACKING_TOOL_USE_DISTINCT", out_name="TMP_PA_C360_4AC_COUNT_PRE"
     )
-    tmp_pa_c360_4ac_count = tmp_pa_c360_4ac_count_pre.loc[tmp_pa_c360_4ac_count_pre["LEVEL_OPPOR"] == 1].copy()
-    tmp_pa_c360_4ac_count["SEGMENT8"] = tmp_pa_c360_4ac_count["ADVC_TOOL_NM"]
-    # Dates + fields are already populated
-    track("TMP_PA_C360_4AC_COUNT", tmp_pa_c360_4ac_count, counts)
+    tmp_pa_C360_4ac_count = tmp_pa_C360_4ac_count_pre.copy()
+    tmp_pa_C360_4ac_count["LEVEL_OPPOR"] = 1  # already deduped above
+    tmp_pa_C360_4ac_count = tmp_pa_C360_4ac_count.loc[tmp_pa_C360_4ac_count["LEVEL_OPPOR"].eq(1)].copy()
+    tmp_pa_C360_4ac_count["SEGMENT8"] = tmp_pa_C360_4ac_count.get("ADVC_TOOL_NM")
+    track("TMP_PA_C360_4AC_COUNT", tmp_pa_C360_4ac_count, counters)
 
-    # Count assessment (RDE PA003) (screen 18)
-    tmp_pa_c360_ac_count_assessment = (
-        tmp_pa_c360_4ac_count
-        .assign(SEGMENT4=lambda d: d["IS_PROD_APRP_FOR_CLNT"].map(map_segment4),
-                HOLDOUTFLAG="N",
-                VOLUME=1, AMOUNT=1.0)
-        .groupby([
-            "REGULATORYNAME","LOB","REPORTNAME","CONTROLRISK","TESTTYPE","TESTPERIOD","PRODUCTTYPE",
-            "SEGMENT","SEGMENT2","SEGMENT3","SEGMENT4","SEGMENT5","SEGMENT6","SEGMENT7","SEGMENT8",
-            "SEGMENT10","HOLDOUTFLAG","COMMENTCODE","COMMENTS","DATECOMPLETED","SNAPDATE"
-        ], dropna=False, as_index=False)
-        .agg({"VOLUME":"sum","AMOUNT":"sum"})
+    tmp_pa_C360_ac_count_assessment = tmp_pa_C360_4ac_count.copy()
+    tmp_pa_C360_ac_count_assessment["RDE"] = "PA003_Client360_Completeness_Tool"
+    tmp_pa_C360_ac_count_assessment["SEGMENT4"] = tmp_pa_C360_ac_count_assessment["IS_PROD_APRP_FOR_CLNT"].map(map_segment4)
+    tmp_pa_C360_ac_count_assessment["SEGMENT5"] = tmp_pa_C360_ac_count_assessment["PROD_NOT_APPR_RTNl_TXT_CAT"]
+    gb_cols2 = gb_cols[:-1] + ["SEGMENT8"]  # include segment8; rest same
+    tmp_pa_C360_ac_count_assessment = (
+        tmp_pa_C360_ac_count_assessment.groupby(gb_cols2, dropna=False)
+        .agg(VOLUME=("EVNT_ID","size"))
+        .reset_index()
     )
-    track("TMP_PA_C360_AC_COUNT_ASSESSMENT", tmp_pa_c360_ac_count_assessment, counts)
+    tmp_pa_C360_ac_count_assessment["AMOUNT"] = np.nan
+    track("TMP_PA_C360_AC_COUNT_ASSESSMENT", tmp_pa_C360_ac_count_assessment, counters)
 
-    # -------------------------------
-    # Build autocomplete tables + append (screen 19)
-    # combine_pa_autocomplete = union of the two assessment tables
-    # -------------------------------
-    pa_c360_autocomplete_tool_use = tmp_pa_c360_ac_assessment.copy()
-    pa_c360_autocomplete_count_tool = tmp_pa_c360_ac_count_assessment.copy()
+    # =========================
+    # (9) combine_pa_autocomplete (Screenshot 19)
+    # =========================
+    pa_C360_autocomplete_tool_use = tmp_pa_C360_ac_assessment.copy()
+    pa_C360_autocomplete_Count_Tool = tmp_pa_C360_ac_count_assessment.copy()
 
     combine_pa_autocomplete = pd.concat(
-        [pa_c360_autocomplete_count_tool, pa_c360_autocomplete_tool_use],
+        [pa_C360_autocomplete_Count_Tool, pa_C360_autocomplete_tool_use],
         ignore_index=True, sort=False
     )
-    track("COMBINE_PA_AUTOCOMPLETE", combine_pa_autocomplete, counts)
+    track("COMBINE_PA_AUTOCOMPLETE", combine_pa_autocomplete, counters)
 
-    # -------------------------------
-    # Detail export build (screens 20–22)
-    # tmp_pa_c360_4ac_count_pre -> detail rows with PA_result in set
-    # -------------------------------
-    def map_pa_result(val: str) -> str:
-        if val == "Product Appropriateness assessed outside Client 360":
-            return "Product Appropriateness assessed outside Client 360"
-        if val == "Not Appropriate - Rationale":
-            return "Product Not Appropriate"
-        if val == "Client declined product appropriateness assessment":
-            return "Client declined product appropriateness assessment"
-        if val == "Product Appropriate":
-            return "Product Appropriate"
-        return "Missing"
-
-    tmp_pa_c360_4ac_count_pre = tmp_pa_c360_4ac.merge(
-        tracking_tool_use_distinct, on="OPPOR_ID", how="left"
-    )
-
-    # Map final fields for detail output
-    detail_cols = {
-        "SEGMENT10": "EVENT_MONTH",
-        "DATECOMPLETED": "REPORTING_DATE",
-        # also keep: event_week_ending (end-of-week), event_date (EVNT_DT),
+    # =========================
+    # (10) DETAIL export set (Screenshots 21–22)
+    # =========================
+    # Build PA_RESULT (same CASE as assessment)
+    tmp_pa_C360_4ac_count_pre["PA_RESULT"] = tmp_pa_C360_4ac_count_pre["IS_PROD_APRP_FOR_CLNT"].map(map_segment4)
+    detail_filter_set = {
+        "Product Not Appropriate",
+        "Missing",
+        "Product Appropriateness assessed outside of Client360",
     }
-    detail_out = tmp_pa_c360_4ac_count_pre.copy()
-    detail_out["EVENT_MONTH"] = pd.to_datetime(detail_out["EVNT_DT"], errors="coerce").dt.to_period("M").astype(str).str.replace("-", "")
-    detail_out["EVENT_WEEK_ENDING"] = pd.to_datetime(detail_out["EVNT_DT"], errors="coerce").map(intnx_week7_end)
-    detail_out["EVENT_DATE"] = pd.to_datetime(detail_out["EVNT_DT"], errors="coerce")
-    detail_out["EVENT_TIMESTAMP"] = pd.to_datetime(detail_out["EVNT_TMSMP"], errors="coerce") if "EVNT_TMSMP" in detail_out.columns else pd.NaT
-    detail_out["TOOL_NM"] = detail_out.get("ADVC_TOOL_NM")
-    detail_out["TOOL_USED"] = detail_out.get("TOOL_USED")
-    detail_out["PA_RESULT"] = detail_out["IS_PROD_APRP_FOR_CLNT"].map(map_pa_result)
-    detail_out["PA_RATIONALE"] = detail_out.get("CLNT_RTNL_TXT")
-    detail_out["PA_RATIONALE_VALIDITY"] = detail_out.get("PROD_NOT_APPR_RTNL_TXT_CAT")
-    detail_out["EMPLOYEE_ID"] = detail_out.get("RBC_OPPOR_OWN_ID")
-    detail_out["JOB_CODE"] = detail_out.get("OCCPT_JOB_CD")
-    detail_out["POSITION_TITLE"] = detail_out.get("HR_POSN_TITL_EN")
-    detail_out["EMPLOYEE_TRANSIT"] = detail_out.get("ORG_UNT_NO")
-    detail_out["POSITION_START_DATE"] = pd.to_datetime(detail_out.get("POSN_STRT_DT"), errors="coerce")
-
-    # Filter per SAS:
-    detail_out = detail_out[
-        detail_out["PA_RESULT"].isin([
-            "Product Not Appropriate",
-            "Missing",
-            "Product Appropriateness assessed outside Client 360"
-        ])
+    pa_client360_detail = tmp_pa_C360_4ac_count_pre.loc[
+        tmp_pa_C360_4ac_count_pre["PA_RESULT"].isin(detail_filter_set)
     ].copy()
-    track("DETAIL_EXPORT_ROWS", detail_out, counts)
+    track("DETAIL_ROWS", pa_client360_detail, counters)
 
-    # -------------------------------
-    # Count-by-tool (spec requirement)
-    # -------------------------------
-    count_by_tool = (
-        detail_out.assign(ADVC_TOOL_NM=lambda d: d.get("ADVC_TOOL_NM"))
-        .groupby("ADVC_TOOL_NM", dropna=False)
-        .size()
-        .reset_index(name="ROW_COUNT")
-        .sort_values("ROW_COUNT", ascending=False)
-    )
-    count_by_tool.columns = count_by_tool.columns.str.upper()
-    track("COUNT_BY_TOOL", count_by_tool, counts)
+    # =========================
+    # (11) Excel exports
+    # =========================
+    autocomplete_path = os.path.join(outdir, "pa_client360_autocomplete.xlsx")
+    with pd.ExcelWriter(autocomplete_path, engine="openpyxl") as xw:
+        pa_C360_autocomplete_tool_use.to_excel(xw, sheet_name="autocomplete_tool_use", index=False)
+        pa_C360_autocomplete_Count_Tool.to_excel(xw, sheet_name="autocomplete_count_tool", index=False)
+        combine_pa_autocomplete.to_excel(xw, sheet_name="autocomplete", index=False)
+    logging.info(f"Excel written: {autocomplete_path}")
 
-    # -------------------------------
-    # Excel exports
-    # -------------------------------
-    os.makedirs(outdir, exist_ok=True)
-    # 1) Autocomplete file
-    auto_path = os.path.join(outdir, "pa_client360_autocomplete.xlsx")
-    with pd.ExcelWriter(auto_path, engine="openpyxl") as xw:
-        pa_c360_autocomplete_count_tool.to_excel(xw, sheet_name="Count_Tool", index=False)
-        pa_c360_autocomplete_tool_use.to_excel(xw, sheet_name="Tool_Use", index=False)
-        combine_pa_autocomplete.to_excel(xw, sheet_name="combined", index=False)
-    logging.info(f"Autocomplete Excel written: {auto_path}")
-
-    # 2) Detail file (runday stamped, like SAS outpath/&runday/..)
-    detail_path = os.path.join(outdir, f"pa_client360_detail_{win['RUNDAY'].strftime('%Y%m%d')}.xlsx")
+    detail_path = os.path.join(outdir, f"pa_client360_detail_{RUNDAY}.xlsx")
     with pd.ExcelWriter(detail_path, engine="openpyxl") as xw:
-        detail_out.to_excel(xw, sheet_name="detail", index=False)
-        count_by_tool.to_excel(xw, sheet_name="count_by_tool", index=False)
-    logging.info(f"Detail Excel written: {detail_path}")
+        pa_client360_detail.to_excel(xw, sheet_name="detail", index=False)
+    logging.info(f"Excel written: {detail_path}")
 
-    # -------------------------------
-    # Validation hook (±1% vs SAS)
-    # Provide baseline counts via env or skip.
-    # -------------------------------
-    # Example (optional):
-    # sas_baseline_detail = int(os.getenv("SAS_BASELINE_DETAIL","0"))
-    # if sas_baseline_detail:
-    #     delta = abs(len(detail_out) - sas_baseline_detail) / max(sas_baseline_detail,1)
-    #     assert delta <= 0.01, f"Detail rows differ by >1% (py={len(detail_out)}, sas={sas_baseline_detail})"
-
-    logging.info(f"FINAL COUNTS: {counts}")
-    logging.info("ETL COMPLETE.")
+    # =========================
+    # (12) Final counts + success
+    # =========================
+    logging.info(f"FINAL ROW COUNTS: {counters}")
+    con.close()
     return 0
 
 
@@ -646,18 +613,21 @@ def run_pipeline(outdir: str, initial_run_flag: Optional[str] = None) -> int:
 # CLI
 # ------------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="PA Client360 ETL (SAS → Python)")
-    ap.add_argument("--outdir", required=True, help="Output directory for Excel files")
-    ap.add_argument("--ini-run", dest="ini_run", choices=["Y","N"], default="N",
-                    help="Initial run flag (Y uses launch dates)")
-    ap.add_argument("-v","--verbose", action="count", default=0, help="Increase log verbosity")
-    return ap.parse_args()
+    p = argparse.ArgumentParser(description="Client360 PA – SAS to Python (1:1)")
+    p.add_argument("--creds", required=True, help="Path to Teradata creds JSON (url,user,password)")
+    p.add_argument("--outdir", required=True, help="Output directory for Excel files")
+    p.add_argument("--ini-run", default="N", choices=["N","Y"], help="INI-RUN flag (N for testing, Y to use launch dates)")
+    p.add_argument("--log", default=None, help="Log file path (optional)")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity")
+    return p.parse_args()
 
-def main():
+
+def main() -> None:
     args = parse_args()
-    setup_logging(args.verbose)
-    rc = run_pipeline(outdir=args.outdir, initial_run_flag=args.ini_run)
+    setup_logging(args.log, args.verbose)
+    rc = run_pipeline(creds=args.creds, outdir=args.outdir, ini_run=args.ini_run)
     sys.exit(rc)
+
 
 if __name__ == "__main__":
     main()
