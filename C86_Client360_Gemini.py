@@ -616,35 +616,35 @@ try:
 
     # --- 23. Append and Save Autocomplete Data ---
     logging.info("Step 23: Appending and saving autocomplete data...")
-    autocomplete_path = AC_PATH / PERSISTENT_AC_FILE
-    today_date = pd.to_datetime(dates['tday'], format='%Y%m%d').date()
+    # autocomplete_path = AC_PATH / PERSISTENT_AC_FILE
+    # today_date = pd.to_datetime(dates['tday'], format='%Y%m%d').date()
 
-    if autocomplete_path.exists():
-        logging.info(f"Appending to existing file: {autocomplete_path}")
-        ac_pa_client360_autocomplete_old = pd.read_parquet(autocomplete_path)
+    # if autocomplete_path.exists():
+    #     logging.info(f"Appending to existing file: {autocomplete_path}")
+    #     ac_pa_client360_autocomplete_old = pd.read_parquet(autocomplete_path)
         
-        # Ensure DateCompleted is date object for comparison
-        ac_pa_client360_autocomplete_old['datecompleted'] = pd.to_datetime(
-            ac_pa_client360_autocomplete_old['datecompleted']
-        ).dt.date
+    #     # Ensure DateCompleted is date object for comparison
+    #     ac_pa_client360_autocomplete_old['datecompleted'] = pd.to_datetime(
+    #         ac_pa_client360_autocomplete_old['datecompleted']
+    #     ).dt.date
         
-        # SAS: where=(DateCompleted=input("&runday", anydtdte8.))
-        # This is a *filter*, so we take everything NOT from today
-        ac_pa_client360_autocomplete_filtered = ac_pa_client360_autocomplete_old[
-            ac_pa_client360_autocomplete_old['datecompleted'] != today_date
-        ]
+    #     # SAS: where=(DateCompleted=input("&runday", anydtdte8.))
+    #     # This is a *filter*, so we take everything NOT from today
+    #     ac_pa_client360_autocomplete_filtered = ac_pa_client360_autocomplete_old[
+    #         ac_pa_client360_autocomplete_old['datecompleted'] != today_date
+    #     ]
         
-        ac_pa_client360_autocomplete = pd.concat(
-            [ac_pa_client360_autocomplete_filtered, combine_pa_autocomplete], 
-            ignore_index=True
-        )
-    else:
-        logging.info(f"Creating new file: {autocomplete_path}")
-        ac_pa_client360_autocomplete = combine_pa_autocomplete.copy()
+    #     ac_pa_client360_autocomplete = pd.concat(
+    #         [ac_pa_client360_autocomplete_filtered, combine_pa_autocomplete], 
+    #         ignore_index=True
+    #     )
+    # else:
+    #     logging.info(f"Creating new file: {autocomplete_path}")
+    #     ac_pa_client360_autocomplete = combine_pa_autocomplete.copy()
 
-    # Save the persistent parquet file
-    ac_pa_client360_autocomplete.to_parquet(autocomplete_path, index=False)
-    logging.info(f"Saved persistent file: {autocomplete_path}")
+    # # Save the persistent parquet file
+    # ac_pa_client360_autocomplete.to_parquet(autocomplete_path, index=False)
+    # logging.info(f"Saved persistent file: {autocomplete_path}")
 
     # --- 24. Export Autocomplete to Excel ---
     logging.info("Step 24: Exporting autocomplete to Excel...")
