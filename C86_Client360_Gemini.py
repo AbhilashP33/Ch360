@@ -649,7 +649,15 @@ try:
     # --- 24. Export Autocomplete to Excel ---
     logging.info("Step 24: Exporting autocomplete to Excel...")
     excel_path = AC_PATH / "pa_client360_autocomplete.xlsx"
-    ac_pa_client360_autocomplete.to_excel(excel_path, sheet_name="autocomplete", index=False, engine='openpyxl')
+    # --- START FIX ---
+    # Use ExcelWriter to set the date_format
+    with pd.ExcelWriter(excel_path, engine='openpyxl', 
+                        datetime_format='MM/DD/YYYY H:MM:SS', 
+                        date_format='MM/DD/YYYY') as writer:
+        
+        ac_pa_client360_autocomplete.to_excel(writer, sheet_name="autocomplete", index=False)
+    # --- END FIX ---
+    # ac_pa_client360_autocomplete.to_excel(excel_path, sheet_name="autocomplete", index=False, engine='openpyxl')
     logging.info(f"Exported autocomplete Excel: {excel_path}")
     
     # --- 25. Create and Export Detail File ---
@@ -681,7 +689,7 @@ try:
         'reporting_date': pd.to_datetime(df_detail_filtered['datecompleted']),
         'event_week_ending': pd.to_datetime(df_detail_filtered['snapdate']),
         'event_date': pd.to_datetime(df_detail_filtered['EVNT_DT']),
-        'event_timestamp': pd.to_datetime(df_detail_filtered['EVNT_TMESTMP']),
+        'event_timestamp': pd.to_datetime(df_detail_filtered['CREAT_TMESTMP']),
         'opportunity_id': df_detail_filtered['OPPOR_ID'],
         'opportunity_type': df_detail_filtered['OPPOR_REC_TYP'],
         'product_code': df_detail_filtered['PROD_CD'],
@@ -703,32 +711,55 @@ try:
 
     # Export detail file
     detail_excel_path = DATAOUT_PATH / f"pa_client360_detail_{runday}.xlsx"
-    
-    # Apply Excel formatting for dates
-    with pd.ExcelWriter(detail_excel_path, engine='openpyxl', 
-                        datetime_format='MM/DD/YYYY', 
-                        date_format='MM/DD/YYYY') as writer:
+
+    # --- START FIX ---
+    # Use ExcelWriter to manually apply formats to each date/datetime column
+    with pd.ExcelWriter(detail_excel_path, engine='openpyxl') as writer:
         
         pa_client360_detail.to_excel(writer, sheet_name="detail", index=False)
         
         # Get the worksheet
         worksheet = writer.sheets['detail']
         
-        # Apply specific format for timestamp
-        # Find the column letter for event_timestamp
-        for col in worksheet.columns:
-            if col[0].value == 'event_timestamp':
-                col_letter = col[0].column_letter
+        # Define formats
+        date_format = 'MM/DD/YYYY'
+        timestamp_format = 'M/D/YYYY H:MM:SS AM/PM'
+        
+        # Find column letters by header name
+        col_letters = {}
+        for cell in worksheet[1]: # Get header row
+            col_letters[cell.value] = cell.column_letter
+
+        # Columns to format
+        date_cols = ['reporting_date', 'event_week_ending', 'event_date', 'position_start_date']
+        
+        # Apply date format
+        for col_name in date_cols:
+            if col_name in col_letters:
+                col_letter = col_letters[col_name]
                 for cell in worksheet[col_letter][1:]: # Skip header
-                    cell.number_format = 'M/D/YYYY H:MM:SS AM/PM'
-                break
+                    if cell.value: # Don't format empty cells
+                        cell.number_format = date_format
+
+        # Apply timestamp format
+        if 'event_timestamp' in col_letters:
+            col_letter = col_letters['event_timestamp']
+            for cell in worksheet[col_letter][1:]: # Skip header
+                if cell.value:
+                    cell.number_format = timestamp_format
+    # --- END FIX ---
 
     logging.info(f"Exported detail file: {detail_excel_path}")
 
     # --- 26. Export Pivot Table ---
     logging.info("Step 26: Exporting Pivot table...")
     pivot_excel_path = AC_PATH / "pa_client360_Pivot.xlsx"
-    ac_pa_client360_autocomplete.to_excel(pivot_excel_path, sheet_name="Autocomplete", index=False, engine='openpyxl')
+    with pd.ExcelWriter(pivot_excel_path, engine='openpyxl', 
+                        datetime_format='MM/DD/YYYY H:MM:SS', 
+                        date_format='MM/DD/YYYY') as writer:
+        
+    ac_pa_client360_autocomplete.to_excel(writer, sheet_name="Autocomplete", index=False)
+    #ac_pa_client360_autocomplete.to_excel(pivot_excel_path, sheet_name="Autocomplete", index=False, engine='openpyxl')
     logging.info(f"Exported pivot file: {pivot_excel_path}")
 
     logging.info("="*50)
